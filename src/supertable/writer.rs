@@ -2522,7 +2522,7 @@ fn build_one_shard_with_layout(
     let scalar_batches: Vec<&RecordBatch> = slice.iter().map(|b| &b.scalar).collect();
     let scalar_stats = ScalarStatsAgg::from_batches(&scalar_schema, &scalar_batches);
 
-    let scratch_root = crate::config::ensure_scratch_root()?;
+    let scratch_root = crate::config::get_scratch_root();
 
     // Stream the assembled superfile to a temp file, then mmap it back as
     // zero-copy `Bytes`, rather than materializing the whole superfile as an
@@ -3616,7 +3616,7 @@ fn drain_epoch_id(
 }
 
 fn drain_scratch_dir(epoch_id: &str) -> PathBuf {
-    crate::config::scratch_root()
+    crate::config::get_scratch_root()
         .join("infino-drain")
         .join(epoch_id)
 }
@@ -5987,7 +5987,7 @@ fn build_one_shard_from_packed_cells(
     let n_docs = stable_ids.len() as u64;
     let scalar_stats = ScalarStatsAgg::from_batches(&options.scalar_schema(), &[&scalar]);
 
-    let scratch_root = crate::config::ensure_scratch_root()?;
+    let scratch_root = crate::config::get_scratch_root();
 
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
@@ -6538,7 +6538,7 @@ fn build_one_packed_shard_via_drain(
         .collect();
     builder.set_prebuilt_multi_cell_ivfs(subsections)?;
 
-    let scratch_root = crate::config::ensure_scratch_root()?;
+    let scratch_root = crate::config::get_scratch_root();
     // Stream the compacted superfile to a temp file, then mmap it back as
     // zero-copy `Bytes` (same idiom as the append-commit build path) instead of
     // materializing the merged superfile as an anon `Vec<u8>` — the merge
@@ -6898,7 +6898,7 @@ fn pending_metadata_schema(metadata: &[u8]) -> Option<u32> {
 /// controls placement). Removed on success; an aborted pass leaves
 /// local-disk garbage only.
 fn repack_scratch_dir() -> PathBuf {
-    crate::config::scratch_root()
+    crate::config::get_scratch_root()
         .join("infino-repack")
         .join(Uuid::new_v4().to_string())
 }

@@ -1384,8 +1384,7 @@ impl FtsBuilder {
     /// [`Self::with_scratch`] pointing at an instance-store NVMe
     /// partition.
     pub fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
-        let scratch_root =
-            crate::config::ensure_scratch_root().expect("create configured Infino temp root");
+        let scratch_root = crate::config::get_scratch_root();
 
         let scratch_dir = tempfile::Builder::new()
             .prefix("infino-fts-")
