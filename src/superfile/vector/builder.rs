@@ -455,7 +455,8 @@ impl Default for VectorBuilder {
 
 impl VectorBuilder {
     /// Construct a builder with the scratch directory at `storage.scratch_root`
-    /// and the default 256 MiB spill threshold.
+    /// (will default to `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// default 256 MiB spill threshold.
     ///
     /// The scratch tempdir is created lazily when the build first
     /// needs scratch space. Operators running large builds should

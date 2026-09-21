@@ -1375,7 +1375,8 @@ pub struct FtsBuilder {
 
 impl FtsBuilder {
     /// Construct a builder with the scratch directory at `storage.scratch_root`
-    /// and the default 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
+    /// (will default to `$TMPDIR` via `tempfile::tempdir()`) and the
+    /// default 256 MiB spill threshold. Mirror of `VectorBuilder::new`.
     ///
     /// Panics if creating the scratch tempdir fails — same policy
     /// as `VectorBuilder::new` for the same reason (no realistic
