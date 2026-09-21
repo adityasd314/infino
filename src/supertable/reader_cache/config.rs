@@ -6,6 +6,7 @@
 
 use std::{
     collections::HashSet,
+    env::temp_dir,
     fmt::{self, Debug},
     path::PathBuf,
     sync::atomic::AtomicU64,
@@ -145,7 +146,7 @@ const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
 impl Default for DiskCacheConfig {
     fn default() -> Self {
         Self {
-            cache_root: crate::config::get_scratch_root().join("infino-disk-cache"),
+            cache_root: temp_dir().join("infino-disk-cache"),
             disk_budget_bytes: DEFAULT_DISK_BUDGET_BYTES,
             cold_fetch_mode: ColdFetchMode::default(),
             cold_fetch_streams: DEFAULT_COLD_FETCH_STREAMS,

@@ -576,7 +576,7 @@ impl Supertable {
                     .map(|c| c.rerank_codec.is_ivf_mergeable())
             });
 
-            let scratch_root = crate::config::get_scratch_root();
+            let scratch_root = crate::config::scratch_root();
 
             // Every merge kind streams its output to a temp file and mmaps it
             // back, so the corpus-sized merge output is never held as an anon

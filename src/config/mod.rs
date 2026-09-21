@@ -189,10 +189,7 @@ pub fn global() -> &'static Config {
 }
 
 /// Resolve the root used for temporary scratch space.
-///
-/// This function only resolves the path;
-/// callers that need to create files should use [`ensure_scratch_root`].
-pub(crate) fn get_scratch_root() -> PathBuf {
+pub(crate) fn scratch_root() -> PathBuf {
     global()
         .storage
         .scratch_root

@@ -437,7 +437,7 @@ pub(crate) async fn fetch_centroid_section(
         )));
     }
 
-    let scratch_root = crate::config::get_scratch_root();
+    let scratch_root = crate::config::scratch_root();
     let spill = NamedTempFile::new_in(&scratch_root)?;
     let mut hasher = blake3::Hasher::new();
     // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,

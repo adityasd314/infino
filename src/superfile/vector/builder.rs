@@ -417,7 +417,7 @@ impl ScratchDir {
             let tmp = if let Some(parent) = &self.parent {
                 tempfile::TempDir::new_in(parent)?
             } else {
-                let scratch_root = crate::config::get_scratch_root();
+                let scratch_root = crate::config::scratch_root();
                 tempfile::Builder::new()
                     .prefix("infino-vector-")
                     .tempdir_in(scratch_root)?
