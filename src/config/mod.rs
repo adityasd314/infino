@@ -51,6 +51,8 @@ use serde::{
     ser::Serializer,
 };
 
+use crate::supertable::reader_cache::config::DEFAULT_PROMOTION_DEFER_TIMEOUT;
+
 /// Embedded baseline. Compiled in via `include_str!`.
 const EMBEDDED_DEFAULT: &str = include_str!("config.yaml");
 
@@ -440,6 +442,11 @@ const DEFAULT_VECTOR_SERVE_NEAR_TIE_SLACK: f32 = 0.30;
 const DEFAULT_VECTOR_ADMIT_EXTENSION_MULT: usize = 3;
 /// Default user superfiles the hidden-index drain materializes per batch.
 const DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES: i64 = 64;
+/// Default drain-side cell assignment path: route through a centroid HNSW
+/// built once per drain (`true`) rather than the 1-bit shortlist + exact
+/// rescore. The graph reaches the same placement much faster as the grid
+/// grows; `false` is the kill-switch back to the shortlist path.
+const DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN: bool = true;
 /// Default boundary-replication budget (commit + drain). `<= 1.0` disables
 /// replication, which is the default: at 10M it was a measured net loss —
 /// the extra boundary copies inflated cell size (159K → 232K rows), crowding
@@ -826,6 +833,12 @@ pub struct VectorSettings {
     pub drain_replica_target_factor: f32,
     /// Per-cell consolidation op the drain applies.
     pub drain_consolidate: DrainConsolidate,
+    /// Route drain-side cell assignment through a centroid HNSW built once
+    /// per drain (default `true`), instead of the 1-bit shortlist + exact
+    /// rescore. The graph reaches the same placement far faster as the grid
+    /// grows; `false` is the kill-switch back to the shortlist path. Small
+    /// grids always take the exact path regardless of this flag.
+    pub drain_graph_assign: bool,
     /// Read fan-out for the drain's superfile opens. `auto` resolves
     /// to one in-flight read per hardware thread, floored at the
     /// background-fill default and capped at 64.
@@ -900,6 +913,7 @@ impl Default for VectorSettings {
             drain_batch_superfiles: DEFAULT_VECTOR_DRAIN_BATCH_SUPERFILES,
             drain_replica_target_factor: DEFAULT_VECTOR_DRAIN_REPLICA_TARGET_FACTOR,
             drain_consolidate: DrainConsolidate::Kmeans,
+            drain_graph_assign: DEFAULT_VECTOR_DRAIN_GRAPH_ASSIGN,
             drain_read_concurrency: ThreadCount::Auto,
             maintenance_threads: ThreadCount::Auto,
             user_cell_count: DEFAULT_VECTOR_USER_CELL_COUNT,
@@ -919,6 +933,11 @@ impl Default for VectorSettings {
 pub struct DiagnosticsSettings {
     /// Accumulate per-phase timers during the vector drain build.
     pub drain_build_timers: bool,
+    /// Emit top-level optimize() phase timers ([optphase]: drain / split / merge
+    /// / recalibrate / settle / compact_total / router_cache) plus the merge
+    /// splice-vs-rebuild split ([optmerge]). Off by default; a measuring stick
+    /// for compaction scaling work.
+    pub optimize_phase_timers: bool,
     /// Emit the FTS builder's finish-phase profile.
     pub fts_profile: bool,
     /// Capture the object-store I/O timeline.
@@ -965,6 +984,7 @@ impl GcSettings {
 pub struct OptimizeOptions {
     pub(crate) compaction: CompactionSettings,
     pub(crate) gc: GcSettings,
+    pub(crate) recalibrate: RecalibratePolicy,
 }
 
 impl OptimizeOptions {
@@ -973,6 +993,7 @@ impl OptimizeOptions {
         Self {
             compaction: settings,
             gc: GcSettings::default(),
+            recalibrate: RecalibratePolicy::default(),
         }
     }
 
@@ -981,6 +1002,32 @@ impl OptimizeOptions {
         self.gc = gc;
         self
     }
+
+    /// Override how `optimize()` handles probe-law recalibration (default
+    /// [`RecalibratePolicy::Auto`] when unset — backward compatible).
+    pub fn with_recalibrate(mut self, recalibrate: RecalibratePolicy) -> Self {
+        self.recalibrate = recalibrate;
+        self
+    }
+}
+
+/// How `optimize()` treats the probe-law recalibration — the O(N) query-serving
+/// calibration, separable from the storage-necessary drain/split/merge which
+/// always run. Storage work is unaffected by this; only recalibration is gated.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecalibratePolicy {
+    /// Engine decides: recalibrate when the live superfile set changed since the
+    /// pre-pass snapshot, or the rerank law lags its pool.
+    #[default]
+    Auto,
+    /// Always recalibrate this optimize, regardless of the Auto condition — for a
+    /// final optimize before serving, when the laws must reflect the full corpus.
+    Force,
+    /// Skip recalibration this optimize; the storage-necessary drain/split/merge
+    /// still run. For a repeated-optimize ingest loop where no query is served
+    /// until a later, deliberately recalibrated optimize.
+    Skip,
 }
 
 /// Persistent storage backend selected by [`StorageSettings`].
@@ -1078,6 +1125,15 @@ pub struct StorageSettings {
     /// `mmap_cold_threshold_secs` and not accessed since the
     /// previous sweep. Default: 75 s.
     pub mmap_sweep_interval_secs: u64,
+    /// How long a background superfile fill yields to foreground
+    /// queries holding the same superfile's lazy reader before it
+    /// downloads anyway. Default: 10 s. `0` promotes immediately;
+    /// a superfile under continuous query load would otherwise never
+    /// go idle, so the fill would never run and the reader would stay
+    /// in its heap-resident lazy state for the life of the process.
+    /// See
+    /// [`crate::supertable::reader_cache::DiskCacheConfig::promotion_defer_timeout`].
+    pub promotion_defer_timeout_secs: u64,
 }
 
 impl Default for StorageSettings {
@@ -1098,6 +1154,7 @@ impl Default for StorageSettings {
             prefetch_concurrency: DEFAULT_PREFETCH_CONCURRENCY,
             mmap_cold_threshold_secs: DEFAULT_MMAP_COLD_THRESHOLD_SECS,
             mmap_sweep_interval_secs: DEFAULT_MMAP_SWEEP_INTERVAL_SECS,
+            promotion_defer_timeout_secs: DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS,
         }
     }
 }
@@ -1117,6 +1174,14 @@ pub(crate) const DEFAULT_PREFETCH_CONCURRENCY: usize = 8;
 const DEFAULT_MMAP_COLD_THRESHOLD_SECS: u64 = 300;
 /// Default background mmap-sweep period (seconds).
 const DEFAULT_MMAP_SWEEP_INTERVAL_SECS: u64 = 75;
+/// Default window a background fill yields to same-superfile foreground
+/// queries before promoting anyway (seconds).
+///
+/// Derived from the runtime-side default rather than restated, so the YAML
+/// default and [`DiskCacheConfig`]'s can never drift apart.
+///
+/// [`DiskCacheConfig`]: crate::supertable::reader_cache::DiskCacheConfig
+const DEFAULT_PROMOTION_DEFER_TIMEOUT_SECS: u64 = DEFAULT_PROMOTION_DEFER_TIMEOUT.as_secs();
 
 fn default_id_column() -> String {
     "_id".to_string()
@@ -1458,6 +1523,24 @@ mod tests {
     fn embedded_default_loads_with_expected_value() {
         let cfg = Config::defaults().expect("embedded default must parse");
         assert_eq!(cfg.supertable.commit_threshold_size_mb, 1024);
+    }
+
+    /// Drain graph-assign ships on, and the kill-switch parses to `false`.
+    #[test]
+    fn drain_graph_assign_defaults_on_and_toggles() {
+        let cfg = Config::defaults().expect("defaults parse");
+        assert!(
+            cfg.vector.drain_graph_assign,
+            "graph-routed drain assign is the shipped default"
+        );
+        let off = Config::from_figment(Figment::new().merge(Yaml::string(EMBEDDED_DEFAULT)).merge(
+            Serialized::defaults(json!({ "vector": { "drain_graph_assign": false } })),
+        ))
+        .expect("kill-switch config loads");
+        assert!(
+            !off.vector.drain_graph_assign,
+            "drain_graph_assign: false must reach the exact path"
+        );
     }
 
     /// A retired key must FAIL the load, not be quietly dropped.

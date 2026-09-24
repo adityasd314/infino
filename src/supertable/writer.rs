@@ -3489,7 +3489,7 @@ async fn persist_superfile_publish_batch_async(
 /// all hardware threads. Sized once, at first use.
 static MAINT_POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
 
-fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
+pub(super) fn maint_pool() -> Result<&'static ThreadPool, BuildError> {
     if let Some(pool) = MAINT_POOL.get() {
         return Ok(pool);
     }
@@ -3749,6 +3749,7 @@ async fn save_drain_remote_checkpoint(
         .map_err(|error| BuildError::Store(format!("drain checkpoint encode: {error}")))?;
     stamp_slow_vector_state(
         inner,
+        false,
         Some(slow_vector_state::PendingDrainState {
             metadata,
             entries: state.entries.clone(),
@@ -4035,7 +4036,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             {
                 tracing::warn!("drain local checkpoint cleanup failed: {error}");
             }
-            refresh_slow_vector_state(&hidden_inner).await?;
+            refresh_slow_vector_state(&hidden_inner, false).await?;
             schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
             return Ok(());
         }
@@ -4282,6 +4283,26 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         }
         packed_cells.push(restore_spilled_packed_cell(&drain_scratch, cell, state)?);
     }
+
+    // Drain-side cell assignment. The default routes each row through a
+    // centroid HNSW built ONCE for the whole drain (the coarse grid is stable
+    // across the batch loop); `vector.drain_graph_assign: false` is the
+    // kill-switch back to the 1-bit shortlist + exact-rescore path, and small
+    // grids (`n_cent < GRAPH_ASSIGN_MIN_N_CENT`) always take the exact path
+    // (the graph's build/walk overhead does not pay there). The router is
+    // built lazily on the first batch that has rows to assign, so a drain with
+    // no assign work never builds it. `running_clusters` is only read inside
+    // the loop (reassigned after it), so one build serves every batch.
+    let drain_graph_assign = config::global().vector.drain_graph_assign;
+    let drain_timers = config::global().diagnostics.drain_build_timers;
+    let mut coarse_router: Option<(opann::Fp32Scorer, opann::Hnsw, Vec<u32>)> = None;
+    let mut drain_assign_total_ms = 0.0f64;
+    // Drain batch-loop sub-phase accumulators (ms), summed across batches:
+    // `materialize` (open + read + row-materialize) and `assign_spill` (assign +
+    // spill-write; the assign compute alone is timed separately above). Surfaced
+    // as an [optdrain] line at batch-loop end under the drain-build-timers gate.
+    let mut drain_mat_total_ms = 0.0f64;
+    let mut drain_assign_spill_total_ms = 0.0f64;
 
     for (batch_idx, (_, batch_sources)) in batches.iter().enumerate() {
         if batch_idx < local_checkpoint.batches_done {
@@ -4542,13 +4563,64 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     let replica_extra_budget =
                         drain_replica_extra_budget(distinct_rows.len(), replica_target);
                     let clusters_ref = &running_clusters;
-                    // Shared admit context + 20% shortlist window: the same
-                    // 1-bit prefilter the commit assign uses, so drain
-                    // assignment compute scales with the window too.
-                    let admit_ctx =
-                        RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
-                    let window = opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
-                    let assignments: Vec<opann::BoundaryAssignment> =
+                    // Graph path only above the small-grid floor; below it the
+                    // exact scan already covers the whole grid cheaply. Cosine
+                    // only: on L2Sq/NegDot the centroid HNSW is hub-dominated
+                    // for the metric's varying-norm geometry and collapses the
+                    // grid at assign time (most cells starve, one becomes a
+                    // catch-all) — recall@10 tolerates it but filtered recall
+                    // craters. Those metrics take the exact shortlist path
+                    // until the coarse router's build is made metric-robust.
+                    let use_graph_assign = drain_graph_assign
+                        && metric == Metric::Cosine
+                        && (clusters_ref.n_cent as usize) >= opann::GRAPH_ASSIGN_MIN_N_CENT;
+                    let assign_t0 = std::time::Instant::now();
+                    let assignments: Vec<opann::BoundaryAssignment> = if distinct_rows.is_empty() {
+                        // No rows to assign: never build the router (skip-empty).
+                        Vec::new()
+                    } else if use_graph_assign {
+                        // Graph-routed assign. Build the coarse centroid router
+                        // ONCE for the drain, lazily on the first batch with
+                        // rows. The build is serial + deterministic (see
+                        // `Hnsw::build_serial`) so cell placement is reproducible
+                        // run to run; the writer-pool install below is for the
+                        // per-row assignment fan-out. The result type is
+                        // identical to the shortlist path, so the spill/replica
+                        // code below is untouched.
+                        // Cosine-only path (gated above), so ef is the cosine
+                        // beam: max(16, round(sqrt(n_cent)/4)).
+                        let ef = opann::coarse_router_ef(clusters_ref.n_cent as usize, metric);
+                        hidden_inner.options.writer_pool.install(|| {
+                            let router = coarse_router.get_or_insert_with(|| {
+                                opann::build_coarse_router(clusters_ref, metric)
+                            });
+                            // Shared reborrows so the parallel closure captures
+                            // `&` (Sync), not the `&mut` from `get_or_insert_with`.
+                            let (scorer, graph, node_to_cell) =
+                                (&router.0, &router.1, &router.2[..]);
+                            distinct_rows
+                                .par_iter()
+                                .map(|row| {
+                                    opann::boundary_assignment_graph_encoded(
+                                        graph,
+                                        scorer,
+                                        node_to_cell,
+                                        clusters_ref,
+                                        metric,
+                                        &row.encoded,
+                                        ef,
+                                    )
+                                })
+                                .collect()
+                        })
+                    } else {
+                        // Shared admit context + 20% shortlist window: the same
+                        // 1-bit prefilter the commit assign uses, so drain
+                        // assignment compute scales with the window too.
+                        let admit_ctx =
+                            RabitqAdmitContext::new(clusters_ref.dim as usize, drain_rot_seed);
+                        let window =
+                            opann::assignment_shortlist_window(clusters_ref.n_cent as usize);
                         hidden_inner.options.writer_pool.install(|| {
                             distinct_rows
                                 .par_iter()
@@ -4562,7 +4634,20 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                                     )
                                 })
                                 .collect()
-                        });
+                        })
+                    };
+                    let assign_ms = assign_t0.elapsed().as_secs_f64() * 1e3;
+                    drain_assign_total_ms += assign_ms;
+                    if drain_timers {
+                        debug!(
+                            batch = batch_idx + 1,
+                            rows = distinct_rows.len(),
+                            n_cent = clusters_ref.n_cent,
+                            graph = use_graph_assign,
+                            assign_ms,
+                            "[optdrain] batch cell-assign phase"
+                        );
+                    }
                     let mut replica_candidates: Vec<(usize, u32, f32)> = assignments
                         .iter()
                         .enumerate()
@@ -4620,6 +4705,8 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                 }
                 local_checkpoint.spills = checkpointed_spills;
                 let t_spill = batch_t0.elapsed().as_secs_f64() * 1e3;
+                drain_mat_total_ms += t_mat;
+                drain_assign_spill_total_ms += t_spill - t_mat;
                 format!(
                     "kmeans: materialize {:.1}ms + {} {:.1}ms, {} batch row(s) -> {} cell spill(s)",
                     t_mat,
@@ -4651,12 +4738,30 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             batch_sources.len(),
         );
     }
+    if drain_timers {
+        debug!(
+            graph = drain_graph_assign,
+            total_ms = drain_assign_total_ms,
+            "[optdrain] total cell-assign phase"
+        );
+        debug!(
+            materialize_ms = drain_mat_total_ms,
+            assign_spill_ms = drain_assign_spill_total_ms,
+            "[optdrain] materialize + assign_spill phases"
+        );
+    }
 
     // One task per final worker shard. Splice cells are already packed; each
     // kmeans worker streams its row-spilled cells one at a time, checkpoints
     // their completed IVF files, then assembles one MultiCellIvf.
     {
         let build_t0 = time::Instant::now();
+        // Drain build sub-phase wall timers (ms), surfaced as [optdrain] under
+        // the drain-build-timers gate. `assemble` (the pack/build/encode/splice/
+        // write region) is derived by difference — build_total - freeze - upload
+        // — so the three reconcile exactly to the build wall total.
+        let mut freeze_ms = 0.0f64;
+        let mut upload_ms = 0.0f64;
         let scratch = drain_scratch.as_path();
         let n_cells_total = added_per_cell.len();
         let total_rows: u64 = added_per_cell.values().map(|count| u64::from(*count)).sum();
@@ -4729,6 +4834,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // shards, and the maintenance pool is contractually
         // optimize-only. The grid MOVES into the task and comes back
         // with the frozen state — no clone of the centroid bytes.
+        let freeze_t0 = time::Instant::now();
         if let Some(mut cal) = width_law.take() {
             let rot_seed = vector_config.rot_seed;
             // Pool from the PRIOR stamp: an incremental drain calibrates
@@ -4747,6 +4853,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             width_law = Some(frozen);
             running_clusters = clusters_back;
         }
+        freeze_ms += freeze_t0.elapsed().as_secs_f64() * 1e3;
         let width_law_ref = width_law.as_ref();
         let prepared_shards: Vec<PreparedSuperfile> = fanout_shards(
             &hidden_inner.options.writer_pool,
@@ -4869,6 +4976,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
                     .map_err(|error| BuildError::Store(error.to_string()))
                 }
             });
+        let upload_t0 = time::Instant::now();
         let mut uploads =
             stream::iter(put_futures).buffer_unordered(commit_write_concurrency().get());
         while let Some(uploaded) = uploads.next().await {
@@ -4922,6 +5030,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             }
             save_drain_local_checkpoint(&drain_scratch, &local_checkpoint)?;
         }
+        upload_ms += upload_t0.elapsed().as_secs_f64() * 1e3;
         if new_entries.len() != expected_shards {
             return Err(BuildError::Store(format!(
                 "drain has {} completed shards but expected {expected_shards}",
@@ -5135,6 +5244,13 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             n_superfiles,
             build_t0.elapsed().as_secs_f64() * 1e3,
         );
+        if drain_timers {
+            let build_total_ms = build_t0.elapsed().as_secs_f64() * 1e3;
+            debug!(
+                assemble_ms = (build_total_ms - freeze_ms - upload_ms).max(0.0),
+                freeze_ms, upload_ms, "[optdrain] assemble + freeze + upload phases"
+            );
+        }
         if crate::superfile::vector::builder::build_phase_timers::enabled() {
             let (train_ms, assign_ms, calib_ms) =
                 crate::superfile::vector::builder::build_phase_timers::snapshot_ms();
@@ -5173,8 +5289,17 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
     // Membership has settled: publish the slow-CAS entry blob and stamp its
     // ref (the per-batch `update`s cleared it). Hidden tables have no manifest
     // parts, so publication is required for reopen and cannot degrade to a
-    // warning.
-    refresh_slow_vector_state(&hidden_inner).await?;
+    // warning. `false`: the drain-tail settle publishes membership only and does
+    // NOT run the O(N) fanout calibration — compaction re-settles and calibrates
+    // (gated by policy), so calibrating here is redundant within an optimize.
+    let __ds = std::time::Instant::now();
+    refresh_slow_vector_state(&hidden_inner, false).await?;
+    if crate::config::global().diagnostics.optimize_phase_timers {
+        eprintln!(
+            "[optphase]   drain_settle {:.1}s",
+            __ds.elapsed().as_secs_f64()
+        );
+    }
     schedule_background_storage_reclaim(Arc::clone(&hidden_inner));
     Ok(())
 }
@@ -7099,6 +7224,7 @@ async fn pin_uploaded_superfiles(
     .map_err(|error| BuildError::Store(format!("split upload pin encode: {error}")))?;
     stamp_slow_vector_state(
         inner,
+        false,
         Some(slow_vector_state::PendingDrainState { metadata, entries }),
     )
     .await
@@ -7110,7 +7236,7 @@ async fn pin_uploaded_superfiles(
 /// never write one). The publish error wins; a failed unpin is logged and
 /// swallowed — the orphans then wait for the next stamp as before.
 async fn unpin_after_failed_publish(inner: &SupertableInner, error: BuildError) -> BuildError {
-    if let Err(unpin) = stamp_slow_vector_state(inner, None).await {
+    if let Err(unpin) = stamp_slow_vector_state(inner, false, None).await {
         debug!("split upload unpin after failed publish: {unpin}");
     }
     error
@@ -8528,6 +8654,17 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // the maintenance pool (`vector.maintenance_threads`), and transient
     // memory stays bounded at one chunk of materialized cells.
     let chunk_cells = pool.current_num_threads().max(1);
+    // Two-pass 1-bit-gated sweep. Pass 1 shortlists survivors by the cheap
+    // 1-bit estimate over every live cell — keeping, per query, the top-CAP
+    // candidates (CAP well above the deepest law k) plus the rerank
+    // histogram. Pass 2 exact-rescores only those survivors, then observes
+    // fine ranks. This replaces an exhaustive fp32 score of every row: the
+    // estimate does the culling, the exact scorer runs only on the shortlist,
+    // and the laws still come from the same `cal.finish` (proven identical to
+    // the exhaustive score by the parity test).
+    //
+    // Pass 1: cheap 1-bit estimate over every live cell -> per-query top-CAP
+    // shortlist (also feeds the rerank histogram).
     for (entry, cells) in &work {
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
@@ -8543,29 +8680,62 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                 loaded.push((cell, rows));
             }
             let chunk_cal = Arc::clone(&cal);
-            run_on_pool(Some(pool), "recalibration score", move || {
-                let result = loaded
+            run_on_pool(Some(pool), "recalibration shortlist", move || {
+                loaded
                     .par_iter()
-                    .try_for_each(|(cell, rows)| chunk_cal.score_rows(*cell, rows));
-                // Release the shared handle BEFORE returning — the oneshot
-                // send follows the return, and the awaiting side unwraps
-                // the Arc after the final recv (a send-then-drop order
-                // raced it: the \"state still shared\" failure under test
-                // parallelism).
+                    .for_each(|(cell, rows)| chunk_cal.shortlist_rows(*cell, rows));
                 drop(chunk_cal);
-                result
             })
             .await
-            .map_err(|e| BuildError::Store(format!("recalibration score: {e}")))??;
+            .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
         }
-        // The fine observation reads subsection/stable-id bytes
-        // SYNCHRONOUSLY (`cell_fine_calibration_views` resolves through
-        // `try_get_range_sync`), and the lazy query opener only exposes
-        // sync bytes after a BACKGROUND mmap promotion — a fresh
-        // post-compaction output racing that promotion would silently
-        // skip its depth observation and keep the previous law, the
-        // staleness this pass exists to fix. Open the way compaction
-        // opens its own inputs: resident bytes guaranteed.
+    }
+    // Pass 2: exact-rescore only the survivors, then observe fine ranks
+    // (which read the now-populated `tops`).
+    let survivors = Arc::new(cal.survivors_by_cell());
+    for (entry, cells) in &work {
+        for chunk in cells.chunks(chunk_cells) {
+            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            for &(cell, _) in chunk {
+                // A cell with no survivor contributes nothing to any query's
+                // top-k — skip its reload entirely.
+                if !survivors.contains_key(&cell) {
+                    continue;
+                }
+                let rows = load_materialized_rows_from_ivf_superfile(
+                    inner,
+                    entry,
+                    &column,
+                    now,
+                    Some(&[cell]),
+                )
+                .await?;
+                loaded.push((cell, rows));
+            }
+            if !loaded.is_empty() {
+                let chunk_cal = Arc::clone(&cal);
+                let chunk_survivors = Arc::clone(&survivors);
+                run_on_pool(Some(pool), "recalibration rescore", move || {
+                    loaded.par_iter().for_each(|(cell, rows)| {
+                        if let Some(s) = chunk_survivors.get(cell) {
+                            chunk_cal.score_survivors(*cell, rows, s);
+                        }
+                    });
+                    drop(chunk_cal);
+                })
+                .await
+                .map_err(|e| BuildError::Store(format!("recalibration rescore: {e}")))?;
+            }
+        }
+        // Depth observation runs once per entry, after all its chunks have
+        // rescored (so `tops` is fully populated for this entry's cells). The
+        // fine observation reads subsection/stable-id bytes SYNCHRONOUSLY
+        // (`cell_fine_calibration_views` resolves through `try_get_range_sync`),
+        // and the lazy query opener only exposes sync bytes after a BACKGROUND
+        // mmap promotion — a fresh post-compaction output racing that promotion
+        // would silently skip its depth observation and keep the previous law,
+        // the staleness this pass exists to fix. Open the way compaction opens
+        // its own inputs: resident bytes guaranteed.
         let reader = open_compaction_input(
             &inner.options.store,
             inner.options.disk_cache.as_ref(),
@@ -8824,8 +8994,9 @@ pub(super) fn backoff_delay(attempt: u32) -> time::Duration {
 )]
 pub(in crate::supertable) async fn refresh_slow_vector_state(
     inner: &SupertableInner,
+    calibrate_fanout: bool,
 ) -> Result<(), BuildError> {
-    stamp_slow_vector_state(inner, None).await
+    stamp_slow_vector_state(inner, calibrate_fanout, None).await
 }
 
 /// Build + PUT the centroid-router section for the settled generation AND
@@ -9266,29 +9437,37 @@ pub(in crate::supertable) async fn stamp_term_stats(
         let store = Arc::clone(&old.options.store);
         let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
         let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-        let mut readers: Vec<(Uuid, Arc<SuperfileReader>)> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs
-            // next (they surfaced as phantom user-data GETs in cold
-            // measurements that began while a fill was still draining).
-            let reader = open_reader(
-                &store,
-                disk_cache.as_ref(),
-                opt_storage.as_ref(),
-                entry,
-                false,
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            readers.push((entry.superfile_id, reader));
-        }
-        let bytes = term_stats::build(&readers)
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
+        // Readers are opened by `build`, one at a time, and dropped before
+        // the next: each pins its superfile's term dictionary for its
+        // lifetime, so materializing them all here made the pass scale with
+        // table size rather than with the work it does.
+        //
+        // No background fills: this pass reads dictionaries and df headers
+        // only, and a fill here copies EVERY superfile — including
+        // compaction's fresh multi-GiB outputs — into the disk cache. On real
+        // object storage those fills outlive the optimize call and their
+        // reads bleed into whatever runs next (they surfaced as phantom
+        // user-data GETs in cold measurements that began while a fill was
+        // still draining).
+        let bytes = term_stats::build(entries, |entry| {
+            let store = Arc::clone(&store);
+            let disk_cache = disk_cache.clone();
+            let opt_storage = opt_storage.clone();
+            let entry = Arc::clone(entry);
+            async move {
+                open_reader(
+                    &store,
+                    disk_cache.as_ref(),
+                    opt_storage.as_ref(),
+                    &entry,
+                    false,
+                )
+                .await
+                .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+            }
+        })
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
         let reference = term_stats::write(storage.as_ref(), bytes)
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
@@ -9338,6 +9517,12 @@ pub(in crate::supertable) async fn stamp_term_stats(
 /// present with a matching population key and reuses it (a no-op).
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
+    // When false, skip the O(N) centroid-router fanout GT scan
+    // (`build_and_publish_centroid_router_section`) and carry the prior fanout /
+    // router section forward; the cheap membership publish still runs. The
+    // drain-tail settle passes false (compaction re-settles and calibrates), and
+    // compaction passes it per the caller's RecalibratePolicy (Skip -> false).
+    calibrate_fanout: bool,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
 ) -> Result<(), BuildError> {
     let Some(storage) = inner.options.storage.clone() else {
@@ -9430,6 +9615,12 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                     // router (and stamped its fanout) for THIS membership —
                     // reuse it, re-measure nothing.
                     Some(existing) => (Some(existing.clone()), None),
+                    // Fanout calibration gated off (bulk-ingest drain-tail, or a
+                    // Skip-policy compaction): skip the O(N) full-corpus fanout
+                    // GT scan and leave the ref unstamped (queries reconstruct the
+                    // router in memory; the prior fanout law carries forward). A
+                    // later Force/Auto settle measures it once.
+                    None if !calibrate_fanout => (None, None),
                     None => {
                         build_and_publish_centroid_router_section(
                             inner,
@@ -11279,7 +11470,7 @@ mod tests {
         assert_eq!(updated.entries.len(), 1);
         assert_eq!(updated.entries[0].superfile_id, pending_entry.superfile_id);
 
-        refresh_slow_vector_state(table.inner())
+        refresh_slow_vector_state(table.inner(), true)
             .await
             .expect("replace checkpoint with settled slow state");
         assert!(

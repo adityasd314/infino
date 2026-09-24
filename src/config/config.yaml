@@ -432,6 +432,13 @@ vector:
   #   splice — keep each superfile's local clusters verbatim.
   drain_consolidate: kmeans
 
+  # Drain-side cell assignment path:
+  #   true  — route each row through a centroid HNSW built once per drain
+  #           (default). Reaches the same placement as the exact path but far
+  #           faster as the grid grows; small grids fall back to exact.
+  #   false — kill-switch back to the 1-bit shortlist + exact rescore path.
+  drain_graph_assign: true
+
   # Read fan-out for the drain's superfile opens. `auto` resolves to
   # one in-flight read per hardware thread, floored at the
   # background-fill default and capped at 64; or set a positive
@@ -487,6 +494,12 @@ vector:
 diagnostics:
   # Accumulate per-phase timers during the vector drain build.
   drain_build_timers: false
+
+  # Emit top-level optimize() phase timers ([optphase]: drain / split / merge /
+  # recalibrate / settle / compact_total / router_cache) and the merge
+  # splice-vs-rebuild split ([optmerge]). A measuring stick for compaction
+  # scaling work.
+  optimize_phase_timers: false
 
   # Emit the FTS builder's finish-phase profile.
   fts_profile: false
