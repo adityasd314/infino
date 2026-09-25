@@ -86,6 +86,7 @@ use tempfile::{NamedTempFile, tempfile};
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError, FtsError, ReadError, SuperfileReader,
         format::{
@@ -2322,7 +2323,7 @@ fn stream_index_blobs_to_scratch(
     cell_posting_builder: Option<CellPostingBuilder>,
     prebuilt_multi_cell: Option<Vec<(u32, MergedIvfSubsection)>>,
 ) -> Result<(NamedTempFile, NamedTempFile), BuildError> {
-    let scratch_root = crate::config::scratch_root();
+    let scratch_root = scratch_root();
 
     let fts_file = NamedTempFile::new_in(&scratch_root)?;
     let vec_file = NamedTempFile::new_in(&scratch_root)?;

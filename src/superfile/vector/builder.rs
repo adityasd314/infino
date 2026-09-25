@@ -23,33 +23,36 @@ use std::{
 use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
-use crate::superfile::{
-    BuildError,
-    format::{
-        self, FST_SEPARATOR, RESERVED_PREFIX,
-        checksum::{crc32c, crc32c_append},
-        vec::{
-            CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES, MAGIC_BYTES,
-            U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+use crate::{
+    config::scratch_root,
+    superfile::{
+        BuildError,
+        format::{
+            self, FST_SEPARATOR, RESERVED_PREFIX,
+            checksum::{crc32c, crc32c_append},
+            vec::{
+                CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
+                MAGIC_BYTES, U32_BYTES, U64_BYTES, cell_dir_entry, sub_hdr,
+            },
         },
-    },
-    vector::{
-        cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
-        distance::{
-            Metric, distance, encode_sq16_adaptive_row, encode_sq16_row, mean_f32_cluster_major,
-            normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
+        vector::{
+            cell_posting::{MaterializedIvfRow, sq8_residual_norm_sq},
+            distance::{
+                Metric, distance, encode_sq16_adaptive_row, encode_sq16_row,
+                mean_f32_cluster_major, normalize, sq16_adaptive_norm_sq, sq16_decoded_norm_sq,
+            },
+            ivf_merge::MergedIvfSubsection,
+            kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
+            quant::BitQuantizer,
+            rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
+            rotation::RandomRotation,
+            spill::{
+                ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
+                SpilledCellRows,
+            },
+            sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
-        ivf_merge::MergedIvfSubsection,
-        kmeans::{assign_to_centroids, kmeans, kmeans_with_assignments},
-        quant::BitQuantizer,
-        rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
-        reservoir::{Reservoir, default_kmeans_sample_size, partition_kmeans_sample_size},
-        rotation::RandomRotation,
-        spill::{
-            ChunkedVectorSource, InMemoryVectorSource, MmapVectorSource, SpillWriter,
-            SpilledCellRows,
-        },
-        sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
     },
 };
 
@@ -417,7 +420,7 @@ impl ScratchDir {
             let tmp = if let Some(parent) = &self.parent {
                 tempfile::TempDir::new_in(parent)?
             } else {
-                let scratch_root = crate::config::scratch_root();
+                let scratch_root = scratch_root();
                 tempfile::Builder::new()
                     .prefix("infino-vector-")
                     .tempdir_in(scratch_root)?

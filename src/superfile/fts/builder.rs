@@ -91,6 +91,7 @@ use rustc_hash::{FxBuildHasher, FxHashMap};
 use tracing::debug;
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         bits::PackScratch,
@@ -1390,7 +1391,7 @@ impl FtsBuilder {
     /// [`Self::with_scratch`] pointing at an instance-store NVMe
     /// partition.
     pub fn new(tokenizer: Arc<dyn Tokenizer>) -> Self {
-        let scratch_root = crate::config::scratch_root();
+        let scratch_root = scratch_root();
 
         let scratch_dir = tempfile::Builder::new()
             .prefix("infino-fts-")

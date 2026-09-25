@@ -32,7 +32,7 @@ use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
 use crate::{
-    config,
+    config::{self, scratch_root},
     runtime_bridge::carry_span,
     storage::{StorageError, StorageProvider},
     superfile::vector::{flat, hnsw},
@@ -87,7 +87,7 @@ pub(crate) enum SlowVectorStateError {
     HashMismatch,
     #[error("state parse: {0}")]
     Parse(String),
-    #[error("IO error")]
+    #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
 
@@ -437,7 +437,7 @@ pub(crate) async fn fetch_centroid_section(
         )));
     }
 
-    let scratch_root = crate::config::scratch_root();
+    let scratch_root = scratch_root();
     let spill = NamedTempFile::new_in(&scratch_root)?;
     let mut hasher = blake3::Hasher::new();
     // Same striping policy as [`fetch_blob_striped`]: parallel range-GETs,

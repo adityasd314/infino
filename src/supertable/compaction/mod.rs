@@ -33,7 +33,7 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::{CompactionSettings, RecalibratePolicy},
+    config::{CompactionSettings, RecalibratePolicy, scratch_root},
     runtime_bridge::{bridge_on_runtime, run_on_pool},
     superfile::{
         builder::SuperfileBuilder,
@@ -686,7 +686,7 @@ impl Supertable {
                         .map(|c| c.rerank_codec.is_ivf_mergeable())
                 });
 
-                let scratch_root = crate::config::scratch_root();
+                let scratch_root = scratch_root();
                 // Every merge kind streams its output to a temp file and mmaps it
                 // back, so the corpus-sized merge output is never held as an anon
                 // Vec — the allocation that OOMs compaction on a memory-tight host.
