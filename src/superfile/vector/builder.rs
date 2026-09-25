@@ -28,7 +28,7 @@ use crate::{
     superfile::{
         BuildError,
         format::{
-            self, FST_SEPARATOR, RESERVED_PREFIX,
+            self, RESERVED_PREFIX,
             checksum::{crc32c, crc32c_append},
             vec::{
                 CELL_DIR_ENTRY_SIZE, CLUSTER_IDX_COUNT_OFFSET, CLUSTER_IDX_ENTRY_BYTES,
@@ -54,6 +54,7 @@ use crate::{
             sq8_simd::{Sq8EncodeConsts, encode_sq8_residual_row, update_min_max},
         },
     },
+    utils::terms::validate_column_name,
 };
 
 /// Outer-header size (magic + version + n_columns + n_docs + dir_offset).
@@ -505,7 +506,7 @@ impl VectorBuilder {
     /// Register a logical vector index up-front. Returns the assigned
     /// `column_id` (declaration order).
     pub fn register_column(&mut self, config: VectorConfig) -> Result<u32, BuildError> {
-        if config.column.as_bytes().contains(&FST_SEPARATOR) {
+        if !validate_column_name(&config.column) {
             return Err(BuildError::ReservedSeparatorInColumnName(config.column));
         }
         if config.column.starts_with(RESERVED_PREFIX) {
