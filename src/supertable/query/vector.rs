@@ -7429,6 +7429,8 @@ impl SupertableReader {
         filter: Option<VectorFilter<'_>>,
         projection: Option<&[&str]>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
+        self.check_projection(projection)?;
+
         let query = calibrated_query(self, column, query);
         let query: &[f32] = &query;
         // Mark a foreground query in flight so background cache-fills yield
@@ -11686,6 +11688,54 @@ mod tests {
             ids[0],
             *ids.iter().min().expect("ids is non-empty"),
             "the exact-match doc must rank first, got {ids:?}"
+        );
+    }
+
+    /// A row-returning vector search whose projection names a column the table
+    /// does not have is a caller error, and it must surface *before* the search
+    /// runs. `vector_search` validates the projection against the resident
+    /// output schema at its top (fail fast), so the query rejects the unknown
+    /// column immediately instead of running the full search and id/placement
+    /// resolution — at billion scale, gigabytes of I/O — only to reject the
+    /// name at output materialization. The message matches the late
+    /// `resolve_hits_named` check exactly (one shared validator).
+    #[test]
+    fn vector_search_unknown_projection_column_errors() {
+        let dim = 16usize;
+        let schema = schema_with_vector(dim);
+        let opts = options_one_superfile_per_commit(dim);
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("storage"));
+        let st = Supertable::create(opts.with_storage(storage)).expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_vector_batch(0, 16, dim, schema.clone()))
+            .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let mut q = vec![0.0f32; dim];
+        q[0] = 1.0;
+        let err = st
+            .reader()
+            .expect("reader")
+            .vector_search(
+                "emb",
+                &q,
+                5,
+                VectorSearchOptions::new(),
+                None,
+                Some(&["_id", "does_not_exist", "score"]),
+            )
+            .expect_err("a projection naming a nonexistent column must error");
+        assert!(
+            matches!(err, QueryError::InvalidQuery(_)),
+            "an unknown projected column is a bad request, got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown column") && msg.contains("in projection"),
+            "message must name the unknown column and the projection, got {msg:?}"
         );
     }
 
