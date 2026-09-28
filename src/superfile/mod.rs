@@ -23,11 +23,18 @@ pub mod builder;
 pub mod error;
 pub mod format;
 pub mod fts;
+// Visible to the layer-isolated integration tests and benches under
+// `test-helpers`, `pub(crate)` otherwise — the same treatment the reader
+// itself gets, so the id types stay off the shipped public contract while
+// still typing the signatures those tests call.
+#[cfg(feature = "test-helpers")]
+pub mod id_space;
+#[cfg(not(feature = "test-helpers"))]
+pub(crate) mod id_space;
 pub(crate) mod ids;
 pub mod lazy_source;
 pub mod reader;
 pub mod stats;
-pub(crate) mod varint;
 pub mod vector;
 
 pub use error::{BuildError, FtsError, ReadError, VectorError};

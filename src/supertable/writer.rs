@@ -59,6 +59,7 @@ use std::{
     mem,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    str::from_utf8,
     sync::{Arc, Mutex, atomic::Ordering},
     thread::available_parallelism,
     time,
@@ -121,7 +122,7 @@ use crate::{
     InfinoError,
     config::{self, CentroidAlignment, DrainConsolidate, ThreadCount},
     memory::{ConnectionMemoryBudget, Reservation},
-    runtime_bridge::{bridge_on_runtime, run_on_pool},
+    runtime_bridge::{bridge_on_runtime, bridge_sync_to_async, run_on_pool},
     runtime_metrics::{
         ingest::visible_array_bytes,
         op_stats::{self, OpStatsCollector},
@@ -177,19 +178,23 @@ use crate::{
             },
             options_hash,
             part::{self as part_mod, ContentHash, PartId},
+            term_index::{self, Contribution as TermContribution, TermIndexError},
             term_stats,
         },
         query::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
-        reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
+        reader_cache::{
+            DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
+        },
         slow_vector_state::{self, CentroidSection, fetch_centroid_section},
         wal::{
             Lease,
             lease::{self, DEFAULT_LEASE_DURATION},
         },
     },
+    utils::terms::make_key,
 };
 
 /// Multipart chunk size for large superfile uploads.
@@ -2616,6 +2621,14 @@ pub(crate) fn build_subsection_offsets(bytes: &Bytes) -> Option<SubsectionOffset
     // footer tail + vector open ranges + FTS open ranges) so the
     // reader can resolve a superfile's open metadata straight from
     // the manifest part, issuing zero per-superfile open GETs.
+    // The FTS open ranges — the term dictionary and the doc-lengths tail —
+    // are recorded so a cold open knows what to fetch, but no longer copied
+    // into the manifest. They were most of a decoded manifest's bytes on a
+    // large uncompacted table (a copy of every superfile's dictionary,
+    // retained for the manifest's life), and the table-level term index now
+    // tells a routed query where a term's postings sit, so the dictionary is
+    // not read on that path at all. A path that still needs it fetches it
+    // once, lazily, through the disk cache.
     let open_blob = build_open_blob(bytes, total_size, &vec_open_ranges, &fts_open_ranges);
 
     Some(SubsectionOffsets {
@@ -2648,16 +2661,13 @@ fn build_open_blob(
     // Must match `cold_fetch_lazy_with_hints`'s parquet tail
     // speculation length so the overlay covers `source.tail()`.
     const PARQUET_TAIL_SPEC: u64 = 64 * 1024;
-    // The blob is a second copy of the open ranges. For an FTS column
-    // those are the term dictionary and the per-doc lengths; on a
-    // superfile of a million or more documents the dictionary alone runs
-    // to tens of MiB and does not compress, and copying it into every
-    // manifest read costs more than the one round trip it saves the cold
-    // open. So each range is inlined only while it stays under this
-    // size; the reader fetches the ranges the blob lacks in its open
-    // wave. The parquet tail, a small superfile's whole dictionary and
-    // the doc lengths of all but the largest superfiles stay inline, so
-    // a table of many ordinary superfiles opens as it always did.
+    // The blob is a second copy of the open ranges. A vector column's can
+    // grow with the superfile, so each range is inlined only while it
+    // stays under this size and the reader fetches the ranges the blob
+    // lacks in its open wave. An FTS column's open ranges are its header
+    // and doc-lengths directory only — a few hundred bytes at most — so
+    // they always ride inline; its dictionary and length arrays are not
+    // open ranges at all and are read by the queries that need them.
     const OPEN_BLOB_INLINE_MAX_RANGE_BYTES: u64 = 4 * 1024 * 1024;
     let mut blob: Vec<(u64, Vec<u8>)> =
         Vec::with_capacity(1 + vec_open_ranges.len() + fts_open_ranges.len());
@@ -2861,6 +2871,13 @@ fn vector_open_ranges_multi_cell(blob: &[u8], off: u64, dim: usize) -> Option<Ve
     Some(merge_ranges(ranges))
 }
 
+/// The byte ranges an FTS reader reads to open: the fixed header and the
+/// doc-lengths directory (one small entry per column). Both are tiny, so
+/// the manifest carries them inline and a cold open costs no read against
+/// the superfile. The dictionary and the per-document length arrays are
+/// deliberately left out: a query the table-level term index resolves
+/// never reads the dictionary, a match-only query never reads the lengths,
+/// and either is fetched on first use by the query that needs it.
 fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>> {
     let start = off as usize;
     let end = start.checked_add(len as usize)?;
@@ -2868,24 +2885,26 @@ fn fts_open_ranges(bytes: &Bytes, off: u64, len: u64) -> Option<Vec<(u64, u64)>>
     if blob.len() < FTS_HEADER_SIZE {
         return None;
     }
-    let postings_offset =
-        read_u64_le(blob.get(hdr::POSTINGS_OFFSET_OFF..hdr::POSTINGS_OFFSET_OFF + U64_BYTES)?)
-            as usize;
+    let version = read_u32_le(blob.get(hdr::VERSION_OFF..hdr::VERSION_OFF + U32_BYTES)?);
+    let header_size = match version == crate::superfile::format::fts::VERSION_V1_LEGACY {
+        true => FTS_HEADER_SIZE,
+        false => crate::superfile::format::fts::HEADER_SIZE_V2,
+    };
+    let n_columns =
+        read_u32_le(blob.get(hdr::N_COLUMNS_OFF..hdr::N_COLUMNS_OFF + U32_BYTES)?) as usize;
     let doc_lengths_offset =
         read_u64_le(blob.get(hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES)?)
             as usize;
-    if postings_offset > blob.len()
-        || doc_lengths_offset > blob.len()
-        || postings_offset > doc_lengths_offset
-    {
+    // Entries plus the directory's CRC.
+    let dir_len = n_columns
+        .checked_mul(crate::superfile::fts::builder::DOC_LENGTHS_ENTRY_SIZE)?
+        .checked_add(4)?;
+    if header_size > blob.len() || doc_lengths_offset.checked_add(dir_len)? > blob.len() {
         return None;
     }
     Some(merge_ranges(vec![
-        (off, postings_offset as u64),
-        (
-            off + doc_lengths_offset as u64,
-            (blob.len() - doc_lengths_offset) as u64,
-        ),
+        (off, header_size as u64),
+        (off + doc_lengths_offset as u64, dir_len as u64),
     ]))
 }
 
@@ -2931,6 +2950,12 @@ pub(crate) struct PreparedSuperfile {
     /// address a superfile.
     pub(crate) bytes_for_storage: Option<(String, Bytes)>,
     pub(crate) bytes_for_cache: Option<(SuperfileUri, Bytes)>,
+    /// This superfile's term-index contribution — its dictionary walked
+    /// in key order with `df` and postings location per term — spilled to
+    /// a file from the in-memory reader at prepare time, so the commit that
+    /// publishes the entry can publish its postings in the same CAS without
+    /// reading the superfile back. `None` for a superfile with no FTS index.
+    pub(crate) term_contribution: Option<TermContribution>,
 }
 
 impl PreparedSuperfile {
@@ -2987,21 +3012,33 @@ pub(crate) fn build_fts_summary(
         // than a fixed 64 KiB, which is ~1000x over-provisioned for a
         // small superfile. Readers derive the block count from the byte
         // length, so heterogeneous sizes coexist across superfiles.
-        let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
-        for term in &terms {
-            bloom_builder.insert(term);
-        }
         // Recorded here so table-wide BM25 statistics are a fold over the
         // manifest instead of a fan-out that reopens every superfile: the
         // reader summed them during the pass it already makes over the
         // doc-lengths array.
+        let term_bloom = options.storage.is_none().then(|| {
+            let mut bloom_builder = BloomBuilder::sized_for_terms(terms.len());
+            for term in &terms {
+                bloom_builder.insert(term);
+            }
+            bloom_builder.finish()
+        });
         let length_stats = fts_reader
             .column_length_stats(&fc.column)
             .expect("column just registered in this superfile's FTS index");
         out.insert(
             fc.column.clone(),
+            // A storage-backed table routes terms through the table-level
+            // term index, which answers membership exactly for every
+            // committed superfile (its postings publish in the same
+            // commit); a bloom sized for a large superfile's vocabulary
+            // saturates and prunes nothing, so none is written. Readers
+            // treat the absent bloom as no information and keep the
+            // superfile, so a manifest written before the index existed
+            // still routes by its blooms. An in-process table has no
+            // storage and so no index; it keeps the bloom.
             FtsSummaryAgg::new_with_params(
-                bloom_builder.finish(),
+                term_bloom,
                 n_terms_distinct,
                 (min_term, max_term),
                 length_stats,
@@ -3009,6 +3046,78 @@ pub(crate) fn build_fts_summary(
         );
     }
     out
+}
+
+/// Spill this superfile's term-index contribution from a reader over its
+/// in-memory bytes: every FTS column's terms in key order, each with its
+/// `df` and where its postings sit. The reader's source is the bytes just
+/// built, so the awaited calls resolve without I/O; the bridge only lends
+/// them an executor from this synchronous prepare path. Every term carries
+/// its score ceiling in this superfile, at the superfile's own statistics.
+pub(in crate::supertable) fn build_term_contribution(
+    reader: &SuperfileReader,
+    options: &SupertableOptions,
+    superfile_id: Uuid,
+    id_min: i128,
+) -> Result<Option<TermContribution>, BuildError> {
+    // No storage, or no text columns: no term index to publish into.
+    if options.storage.is_none() || options.fts_columns.is_empty() {
+        return Ok(None);
+    }
+    let mut writer = term_index::ContributionWriter::create_in_scratch(superfile_id, id_min)
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    bridge_sync_to_async(write_superfile_terms(reader, &mut writer))
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+    writer
+        .finish()
+        .map(Some)
+        .map_err(|e| BuildError::Store(e.to_string()))
+}
+
+/// Walk every text column of `reader`'s dictionary and append each term's
+/// index facts to `writer`. Columns are visited in name order and a
+/// dictionary yields its terms sorted, so the contribution is in the
+/// ascending key order the merge requires. A superfile with no text index
+/// contributes no terms but is still listed by the index.
+async fn write_superfile_terms(
+    reader: &SuperfileReader,
+    writer: &mut term_index::ContributionWriter,
+) -> Result<(), TermIndexError> {
+    let Some(fts) = reader.fts() else {
+        return Ok(());
+    };
+    let mut columns: Vec<String> = fts.fts_columns_config().map(|c| c.name.clone()).collect();
+    columns.sort();
+    for column in &columns {
+        let term_bytes = fts
+            .iter_column_terms(column)
+            .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        let terms: Vec<&str> = term_bytes
+            .iter()
+            .map(|t| from_utf8(t).map_err(|_| TermIndexError::Build("non-utf8 term".into())))
+            .collect::<Result<_, _>>()?;
+        for chunk in terms.chunks(TERM_INDEX_BATCH_TERMS) {
+            let facts = reader
+                .term_index_facts(column, chunk)
+                .await
+                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+            for (term, fact) in chunk.iter().zip(facts) {
+                // A term the dictionary lists but no cursor could describe
+                // keeps its presence and is given the ceiling that prunes
+                // nothing rather than one that could be wrong.
+                let (df, bound, location) = match fact {
+                    Some(f) => (
+                        f.df,
+                        f.bound,
+                        term_index::Location::from_dict_value(f.entry),
+                    ),
+                    None => (0, f32::INFINITY, term_index::Location::None),
+                };
+                writer.push(&make_key(column, term), df, bound, location)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn build_column_vector_summary(
@@ -3143,11 +3252,14 @@ pub(super) fn prepare_superfile_named(
     });
 
     let storage_key = entry.storage_path();
+    let term_contribution =
+        build_term_contribution(&reader, &inner.options, entry.superfile_id, entry.id_min)?;
     Ok(Some(PreparedSuperfile {
         entry,
         bytes_for_store: bytes_for_store.map(|b| (uri, b)),
         bytes_for_storage: bytes_for_storage.map(|b| (storage_key, b)),
         bytes_for_cache: bytes_for_cache.map(|b| (uri, b)),
+        term_contribution,
     }))
 }
 
@@ -3155,7 +3267,7 @@ pub(super) fn prepare_superfile_named(
 /// per-superfile summaries from the stored `SuperfileReader`, and
 /// publish all entries in one `ArcSwap` of the manifest.
 ///
-/// Per-shard work (reader open, FTS bloom build, vector summary,
+/// Per-shard work (reader open, FTS summary, vector summary,
 /// `SuperfileEntry` construction) runs in parallel across the
 /// writer pool — for an FTS supertable the bloom build alone is
 /// O(n_terms_distinct) per FTS column per shard, which at 10M
@@ -3196,6 +3308,9 @@ struct SuperfilePublishBatch {
     /// local) membership publish succeeds — inserting earlier leaves
     /// orphaned cache entries when the CAS fails (S12).
     pending_store_inserts: Vec<(SuperfileUri, Bytes)>,
+    /// One per superfile with an FTS index; published as a term-index delta
+    /// in the same CAS as the entries.
+    term_contributions: Vec<TermContribution>,
 }
 
 fn collect_prepared_superfiles(
@@ -3206,7 +3321,11 @@ fn collect_prepared_superfiles(
     let mut pending_storage_writes: Vec<(String, Bytes)> = Vec::new();
     let mut pending_cache_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
     let mut pending_store_inserts: Vec<(SuperfileUri, Bytes)> = Vec::new();
+    let mut term_contributions: Vec<TermContribution> = Vec::new();
     for p in prepared {
+        if let Some(c) = p.term_contribution {
+            term_contributions.push(c);
+        }
         if let Some(t) = p.bytes_for_store {
             pending_store_inserts.push(t);
         }
@@ -3224,6 +3343,7 @@ fn collect_prepared_superfiles(
         pending_storage_writes,
         pending_cache_inserts,
         pending_store_inserts,
+        term_contributions,
     })
 }
 
@@ -3388,6 +3508,7 @@ fn prepare_user_superfile_batch_in_scope(
                             bytes_for_store: p.bytes_for_store,
                             bytes_for_storage: p.bytes_for_storage,
                             bytes_for_cache: p.bytes_for_cache,
+                            term_contribution: p.term_contribution,
                         }),
                     )
                 }
@@ -3431,6 +3552,7 @@ async fn persist_superfile_publish_batch_async(
             batch.pending_storage_writes,
             Vec::new(),
             list_metadata,
+            batch.term_contributions,
         )
         .await
         .map_err(BuildError::from)?;
@@ -5081,7 +5203,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
         // The alternative (rescoring every packed cell per incremental
         // drain) would make drain cost track table size, not delta size.
         if let Some(cal) = width_law.take()
-            && let Some(laws) = cal.finish(&running_clusters)
+            && let Some(laws) = cal.finish(&running_clusters, None)
         {
             for (slot, measured) in routing.width_for_k.iter_mut().zip(laws.width_for_k) {
                 *slot = (*slot).max(measured);
@@ -5199,6 +5321,7 @@ pub(in crate::supertable) async fn drain_user_superfiles_to_hidden_cells(
             Vec::new(),
             Vec::new(),
             list_metadata,
+            Vec::new(),
         )
         .await
         .map_err(BuildError::from)?;
@@ -6152,6 +6275,7 @@ fn build_prepared_from_packed_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        term_contribution: prepared.term_contribution,
     })
 }
 
@@ -6256,6 +6380,7 @@ fn build_prepared_from_spilled_cells(
         bytes_for_store: prepared.bytes_for_store,
         bytes_for_storage: prepared.bytes_for_storage,
         bytes_for_cache: prepared.bytes_for_cache,
+        term_contribution: prepared.term_contribution,
     })
 }
 
@@ -6497,6 +6622,7 @@ fn commit_shards_via_drain(
                 bytes_for_store,
                 bytes_for_storage,
                 bytes_for_cache,
+                term_contribution,
             } = prepared;
             let entry = finish_superfile_entry(entry, Some(*shard_id))?;
             // `blocking_send`, not `send`: this runs on a rayon pool thread
@@ -6510,6 +6636,7 @@ fn commit_shards_via_drain(
                     bytes_for_store,
                     bytes_for_storage,
                     bytes_for_cache,
+                    term_contribution,
                 },
             ))
             .map_err(|_| BuildError::Store("pipelined commit uploader closed mid-build".into()))?;
@@ -7539,6 +7666,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         // children (the merge phase rewrites them shortly anyway).
         pending_cache_inserts: _,
         pending_store_inserts,
+        term_contributions,
     } = collect_prepared_superfiles(inner, all_prepared)?;
 
     // Pin the batch's children BEFORE any byte moves: the pin's entries are
@@ -7605,6 +7733,7 @@ pub(in crate::supertable) async fn split_overflow_cell_batch(
         Vec::new(),
         Vec::new(),
         list_metadata,
+        term_contributions,
     )
     .await
     {
@@ -8035,6 +8164,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         // Parity with the batched split: no disk-cache warm fill.
         pending_cache_inserts: _,
         pending_store_inserts,
+        term_contributions,
     } = collect_prepared_superfiles(inner, prepared)?;
 
     // Pin every shard BEFORE any byte moves (entries are metadata): one
@@ -8089,6 +8219,7 @@ pub(in crate::supertable) async fn split_repack_bulk(
         Vec::new(),
         Vec::new(),
         list_metadata,
+        term_contributions,
     )
     .await
     {
@@ -8439,6 +8570,7 @@ pub(in crate::supertable) async fn split_overflow_cells(
             Vec::new(),
             Vec::new(),
             list_metadata,
+            Vec::new(),
         )
         .await
         .map_err(BuildError::from)?;
@@ -8637,6 +8769,119 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     })
     .await
     .map_err(|e| BuildError::Store(format!("recalibration freeze: {e}")))?;
+    // Centroid-router fanout calibration rides the SAME scan: build the router
+    // over the settled fine centroids (byte-identical to the settle-published
+    // one — same superfile × flat node order, `HnswParams::default`) and select
+    // each frozen query's top-fanout clusters, so the scan can tag prefix rows
+    // with their cluster's selection rank. Gated exactly like the settle's
+    // router publish — engaged only when the centroid-graph router is on and
+    // (for `auto`) the table is at/above the scale floor — so a router-off or
+    // sub-floor table skips it and the fanout stays uncalibrated (the sentinel).
+    let dim = clusters.dim as usize;
+    let vcfg = &crate::config::global().vector;
+    let router_column = crate::supertable::query::vector::select_eager_router_column(
+        vcfg.search_mode,
+        vcfg.ivf_router,
+        vcfg.global_fine_fanout,
+        &inner.options.vector_columns,
+    );
+    let router_eligible = router_column.as_deref() == Some(column.as_str())
+        && !(vcfg.ivf_router == crate::config::IvfRouter::Auto
+            && manifest.n_docs_total() < vcfg.centroid_graph_scale_floor_docs);
+    // Per-superfile flat-cluster base (`cell -> flat_base`) for the pass-2
+    // prefix tag, indexed by `si`. Populated by the streaming extraction below
+    // only when the router is built, so no superfile reader is held past its
+    // open.
+    let mut flat_base_by_si: Vec<HashMap<u32, u32>> = Vec::new();
+    #[allow(clippy::type_complexity)]
+    let fanout_calib: Option<(
+        Arc<Vec<Vec<HashMap<u32, u32>>>>,
+        usize,
+        opann::FanoutCalibCtx,
+    )> = if router_eligible {
+        // Stream the live superfiles once, extracting only the small state the
+        // scan needs past the open — each superfile's fine-cluster centroids
+        // (the router nodes) and its per-cell flat-cluster base — dropping each
+        // reader before opening the next. `open_compaction_input` cannot serve a
+        // hidden vector superfile from the mmap disk cache (its vector blob is
+        // left sparse), so it materializes the whole superfile in anonymous
+        // memory; holding one resident reader per live superfile at once would
+        // pin the entire hidden index in RAM.
+        let mut router_cluster_vecs: Vec<(usize, u32, Vec<f32>)> = Vec::new();
+        flat_base_by_si = Vec::with_capacity(work.len());
+        for (si, (entry, cells)) in work.iter().enumerate() {
+            let reader = open_compaction_input(
+                &inner.options.store,
+                inner.options.disk_cache.as_ref(),
+                inner.options.storage.as_ref(),
+                entry,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            let mut bases = HashMap::new();
+            if let Some(vr) = reader.vec() {
+                if let Some(cluster_vecs) = vr.resident_fine_cluster_vectors(column.as_str()) {
+                    for (flat, vec) in cluster_vecs {
+                        router_cluster_vecs.push((si, flat, vec));
+                    }
+                }
+                for &(cell, _) in cells.iter() {
+                    if let Some(base) = vr.flat_cluster_base_for_cell(cell) {
+                        bases.insert(cell, base);
+                    }
+                }
+            }
+            flat_base_by_si.push(bases);
+            drop(reader);
+        }
+        match crate::supertable::query::vector::build_centroid_router_from_cluster_vectors(
+            router_cluster_vecs,
+            dim,
+            metric,
+        ) {
+            Ok(router) if !router.node_map.is_empty() => {
+                let queries = cal.frozen_queries().unwrap_or(&[]);
+                let (selection, max_fanout, register_floor, parity_gap) =
+                    crate::supertable::query::vector::build_router_fanout_selection(
+                        &router,
+                        queries,
+                        dim,
+                        work.len(),
+                        metric,
+                    );
+                let calib_k = WIDTH_LAW_KS
+                    .iter()
+                    .copied()
+                    .filter(|&k| (k as u64) <= total_docs && k <= opann::ROUTER_CALIB_MAX_ANCHOR)
+                    .max()
+                    .unwrap_or(0);
+                let prefix_cap = calib_k
+                    .saturating_mul(opann::PREFIX_POOL_HEADROOM)
+                    .max(calib_k)
+                    .max(1);
+                let ctx = opann::FanoutCalibCtx {
+                    total_fine: router.node_map.len().min(u32::MAX as usize) as u32,
+                    max_fanout,
+                    register_floor,
+                    parity_gap,
+                    n_rows: total_docs.min(usize::MAX as u64) as usize,
+                };
+                Some((Arc::new(selection), prefix_cap, ctx))
+            }
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "recalibration: centroid-router build failed; skipping fanout calibration"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let did_fanout = fanout_calib.is_some();
+
     // Shared handle for the scoring sweep: chunks are MOVED onto the
     // maintenance pool and awaited over a oneshot, so the tokio worker
     // keeps driving the next chunk's loads instead of blocking under the
@@ -8651,17 +8896,9 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // the maintenance pool (`vector.maintenance_threads`), and transient
     // memory stays bounded at one chunk of materialized cells.
     let chunk_cells = pool.current_num_threads().max(1);
-    // Two-pass 1-bit-gated sweep. Pass 1 shortlists survivors by the cheap
-    // 1-bit estimate over every live cell — keeping, per query, the top-CAP
-    // candidates (CAP well above the deepest law k) plus the rerank
-    // histogram. Pass 2 exact-rescores only those survivors, then observes
-    // fine ranks. This replaces an exhaustive fp32 score of every row: the
-    // estimate does the culling, the exact scorer runs only on the shortlist,
-    // and the laws still come from the same `cal.finish` (proven identical to
-    // the exhaustive score by the parity test).
-    //
     // Pass 1: cheap 1-bit estimate over every live cell -> per-query top-CAP
-    // shortlist (also feeds the rerank histogram).
+    // shortlist (also feeds the rerank histogram). No fanout here — the router
+    // prefix pool is collected in pass 2 alongside the exact rescore.
     for (entry, cells) in &work {
         for chunk in cells.chunks(chunk_cells) {
             let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
@@ -8687,12 +8924,22 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             .map_err(|e| BuildError::Store(format!("recalibration shortlist: {e}")))?;
         }
     }
-    // Pass 2: exact-rescore only the survivors, then observe fine ranks
-    // (which read the now-populated `tops`).
+    // Pass 2: exact-rescore only the survivors (populating `tops` for the
+    // width/fine/rerank laws) and, when the router was built, collect the
+    // fanout prefix pool from those same survivors — the exact top-k NNs the
+    // fanout knee reads are always survivors, so the survivor-only prefix pool
+    // is equivalent to the exhaustive one for the law. Then observe fine ranks.
     let survivors = Arc::new(cal.survivors_by_cell());
-    for (entry, cells) in &work {
+    for (si, (entry, cells)) in work.iter().enumerate() {
+        // Per-superfile flat-cluster base for the router prefix tag: a cell's
+        // global flat cluster is `flat_base + row.cluster`. Absent for a v1
+        // (single-cell) superfile, whose cells carry no fanout tag; precomputed
+        // by the streaming extraction above so no superfile reader is held
+        // across the scan.
+        let flat_bases = flat_base_by_si.get(si);
         for chunk in cells.chunks(chunk_cells) {
-            let mut loaded: Vec<(u32, Vec<MaterializedIvfRow>)> = Vec::with_capacity(chunk.len());
+            let mut loaded: Vec<(u32, Option<u32>, Vec<MaterializedIvfRow>)> =
+                Vec::with_capacity(chunk.len());
             for &(cell, _) in chunk {
                 // A cell with no survivor contributes nothing to any query's
                 // top-k — skip its reload entirely.
@@ -8707,15 +8954,31 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
                     Some(&[cell]),
                 )
                 .await?;
-                loaded.push((cell, rows));
+                let flat_base = flat_bases.and_then(|m| m.get(&cell).copied());
+                loaded.push((cell, flat_base, rows));
             }
             if !loaded.is_empty() {
                 let chunk_cal = Arc::clone(&cal);
                 let chunk_survivors = Arc::clone(&survivors);
+                // Clone the shared selection handle + cap for this chunk; `si`
+                // indexes the per-superfile selection the router built above.
+                let fanout_for_chunk = fanout_calib
+                    .as_ref()
+                    .map(|(sel, cap, _)| (Arc::clone(sel), *cap, si));
                 run_on_pool(Some(pool), "recalibration rescore", move || {
-                    loaded.par_iter().for_each(|(cell, rows)| {
+                    loaded.par_iter().for_each(|(cell, flat_base, rows)| {
                         if let Some(s) = chunk_survivors.get(cell) {
-                            chunk_cal.score_survivors(*cell, rows, s);
+                            let fctx = match (&fanout_for_chunk, flat_base) {
+                                (Some((sel, cap, si)), Some(flat_base)) => {
+                                    Some(opann::FanoutScoreCtx {
+                                        flat_base: *flat_base,
+                                        selection: &sel[*si],
+                                        prefix_cap: *cap,
+                                    })
+                                }
+                                _ => None,
+                            };
+                            chunk_cal.score_survivors(*cell, rows, s, fctx.as_ref());
                         }
                     });
                     drop(chunk_cal);
@@ -8764,11 +9027,15 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
     // Every chunk's oneshot was awaited, so this is the last reference.
     let cal = Arc::into_inner(cal)
         .ok_or_else(|| BuildError::Store("recalibration state still shared".into()))?;
-    // The final reduction (rank sorts, coverage crossings) is CPU work
-    // too — same bridge. The entry-snapshot grid is consumed here; the
-    // stamp loop below reloads the FRESH grid from the manifest.
+    // The final reduction (rank sorts, coverage crossings, the router-fanout
+    // knee over the prefix pools) is CPU work too — same bridge. The
+    // entry-snapshot grid is consumed here; the stamp loop below reloads the
+    // FRESH grid from the manifest. `fanout_ctx` carries the ladder ceiling +
+    // knee floors when the router was built above; `None` leaves the fanout the
+    // sentinel.
+    let fanout_ctx = fanout_calib.map(|(_, _, ctx)| ctx);
     let Some(laws) = run_on_pool(Some(pool), "recalibration finish", move || {
-        cal.finish(&clusters)
+        cal.finish(&clusters, fanout_ctx)
     })
     .await
     .map_err(|e| BuildError::Store(format!("recalibration finish: {e}")))?
@@ -8833,9 +9100,18 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
         for (slot, measured) in routing.fine_for_k.iter_mut().zip(laws.fine_for_k) {
             *slot = (*slot).max(measured);
         }
-        // The centroid-graph router fanout is NOT stamped here — it is measured
-        // by real recall at the router's post-commit build stage (the settle's
-        // `refresh_slow_vector_state`) and carried forward here untouched.
+        // The centroid-graph router fanout is now measured on THIS pass's scan
+        // (the router graph built over the settled fine centroids, byte-identical
+        // to the settle-published one) and stamped here — replaced wholesale from
+        // the fresh measurement, sentinels included (a `0` is the meaningful "GFC
+        // can't reach the floor at this k" verdict, not "no data"). Gated on
+        // `evidence_current` exactly like the width replace: when a concurrent
+        // drain moved the membership after the scan, the router we built is stale,
+        // so carry the prior fanout forward untouched. `did_fanout` is false when
+        // the router is off / sub-floor, leaving whatever the manifest carries.
+        if did_fanout && evidence_current {
+            routing.fanout_for_k = laws.fanout_for_k;
+        }
         // Same per-knot merge + provenance as the drain stamp.
         opann::merge_rerank_with_pools(
             &mut routing.rerank_for_k,
@@ -8877,6 +9153,7 @@ pub(in crate::supertable) async fn recalibrate_probe_laws(
             NewEntryBirthVersions::StampCommit,
             &mut Vec::new(),
             &mut Vec::new(),
+            &[],
         )
         .await
         {
@@ -9012,30 +9289,22 @@ async fn build_and_publish_centroid_router_section(
     manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
     centroids_ref: &crate::supertable::manifest::list::RoutingRef,
-) -> (
-    Option<crate::supertable::manifest::list::RoutingRef>,
-    Option<[u32; crate::supertable::manifest::list::WIDTH_LAW_KS.len()]>,
-) {
+) -> Option<crate::supertable::manifest::list::RoutingRef> {
     // Cheap gate first (resolving the column once, reused below), so a
     // router-off table never fetches the centroid section.
     let vcfg = &crate::config::global().vector;
-    let Some(column) = crate::supertable::query::vector::select_eager_router_column(
+    let column = crate::supertable::query::vector::select_eager_router_column(
         vcfg.search_mode,
         vcfg.ivf_router,
         vcfg.global_fine_fanout,
         &inner.options.vector_columns,
-    ) else {
-        return (None, None);
-    };
-    let Some(dim) = inner
+    )?;
+    let dim = inner
         .options
         .vector_columns
         .iter()
         .find(|vc| vc.column == column)
-        .map(|vc| vc.dim)
-    else {
-        return (None, None);
-    };
+        .map(|vc| vc.dim)?;
     // Below the `auto` scale floor, `auto_router_choice` can only ever resolve
     // to `stamped` (the graph measured a loss under ~10M), so building the
     // router, running the recall sweep, and writing the section blob every drain
@@ -9044,29 +9313,27 @@ async fn build_and_publish_centroid_router_section(
     if vcfg.ivf_router == crate::config::IvfRouter::Auto
         && manifest.n_docs_total() < vcfg.centroid_graph_scale_floor_docs
     {
-        return (None, None);
+        return None;
     }
     let section = match fetch_centroid_section(storage, centroids_ref, entries).await {
         Ok(section) => section,
         Err(error) => {
             tracing::warn!(%error, "centroid-router publish: centroid section fetch failed");
-            return (None, None);
+            return None;
         }
     };
-    // Build the router graph + open readers ONCE, shared across the section
-    // encode and the fanout recall calibration (measured against the same
-    // graph). Best-effort: a `None` fanout just carries the prior forward.
-    let (bytes, fanout) =
-        crate::supertable::query::vector::compose_centroid_router_section_and_fanout(
-            &inner.options,
-            manifest,
-            entries,
-            &section,
-            &column,
-            dim,
-        )
-        .await;
-    let section_ref = match bytes {
+    // Build the router graph + open readers ONCE and encode the section.
+    // Best-effort: a `None` just leaves the ref unstamped, and queries
+    // reconstruct the router in memory.
+    let bytes = crate::supertable::query::vector::compose_centroid_router_section(
+        &inner.options,
+        entries,
+        &section,
+        &column,
+        dim,
+    )
+    .await;
+    match bytes {
         Some(bytes) => slow_vector_state::write_resident_index_blob(storage, bytes)
             .await
             .inspect(|reference| {
@@ -9077,8 +9344,7 @@ async fn build_and_publish_centroid_router_section(
             )
             .ok(),
         None => None,
-    };
-    (section_ref, fanout)
+    }
 }
 
 /// The PREVIOUS generation's centroid section for `manifest`, through the
@@ -9393,7 +9659,69 @@ async fn build_hnsw_graph_ref(
     .await
 }
 
-/// Build and publish the global term-stats sidecar over the CURRENT
+/// Publish one maintenance artifact under the commit-race protocol every
+/// stamp shares: load the current manifest, let `successor` build the
+/// artifact against its membership and return the manifest to publish
+/// (`None` when nothing needs publishing), then CAS it in. A lost race
+/// derives the next attempt past any crash-orphaned list and retries
+/// with backoff; `what` names the artifact in the terminal error.
+async fn stamp_with_retries<F, Fut>(
+    inner: &SupertableInner,
+    storage: &Arc<dyn StorageProvider>,
+    what: &str,
+    successor: F,
+) -> Result<(), BuildError>
+where
+    F: Fn(Arc<ManifestSnapshot>) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<ManifestSnapshot>, BuildError>>,
+{
+    let max_retries = inner.options.max_commit_retries.max(1);
+    let mut next_id_floor: u64 = 0;
+    for attempt in 0..max_retries {
+        let old = inner.manifest.load_full();
+        // A prior attempt found its id occupied by a crash-orphaned
+        // manifest list — derive this attempt's successor past it.
+        let old = if next_id_floor > 0 {
+            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
+        } else {
+            old
+        };
+        // Rebuilt per attempt: a competing commit may have changed the
+        // membership, and the artifact must describe exactly the set the
+        // successor manifest publishes.
+        let Some(new_manifest) = successor(Arc::clone(&old)).await? else {
+            return Ok(());
+        };
+        let attempted_id = new_manifest.get_manifest_id();
+        let prev_etag = get_current_manifest_etag(storage, old)
+            .await
+            .inspect_err(|e| inner.note_commit_error(e))
+            .map_err(BuildError::from)?;
+        match new_manifest
+            .write(storage.as_ref(), prev_etag.as_deref(), &[])
+            .await
+        {
+            Ok(()) => {
+                inner.manifest.store(Arc::new(new_manifest));
+                return Ok(());
+            }
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                next_id_floor = next_id_floor.max(
+                    refresh_and_orphaned_id_floor(inner, storage, attempted_id)
+                        .await
+                        .map_err(|e| BuildError::Store(e.to_string()))?,
+                );
+                sleep(backoff_delay(attempt)).await;
+            }
+            Err(e) => return Err(BuildError::Store(e.to_string())),
+        }
+    }
+    Err(BuildError::Store(format!(
+        "{what} publish lost every commit race"
+    )))
+}
+
+/// Build and publish the term-stats sidecar over the CURRENT
 /// membership, stamping its reference on a successor manifest (see
 /// `manifest::term_stats` for artifact semantics and the carry rule).
 /// Maintenance-only: optimize calls it after compaction settles, so the
@@ -9409,98 +9737,154 @@ pub(in crate::supertable) async fn stamp_term_stats(
     if inner.options.fts_columns.is_empty() {
         return Ok(());
     }
-    let max_retries = inner.options.max_commit_retries.max(1);
-    let mut next_id_floor: u64 = 0;
-    for attempt in 0..max_retries {
-        let old = inner.manifest.load_full();
-        let old = if next_id_floor > 0 {
-            Arc::new(old.with_next_manifest_id_floor(next_id_floor))
-        } else {
-            old
-        };
-        let entries = old.get_all_superfiles();
-        // One superfile is its own global statistics: a query gathers df
-        // from that superfile's dictionary — the same numbers, one probe
-        // — so publishing an artifact would only duplicate the dictionary
-        // on disk. Nothing to drop either: a commit that removed the other
-        // superfiles already dropped the reference (the carry rule), and
-        // the next multi-superfile maintenance pass republishes.
-        if entries.len() <= 1 {
-            return Ok(());
-        }
-        // Rebuilt per attempt: a competing commit may have changed the
-        // membership, and the artifact must describe exactly the set the
-        // successor manifest publishes.
-        let store = Arc::clone(&old.options.store);
-        let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-        let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-
-        // Readers are opened by `build`, one at a time, and dropped before
-        // the next: each pins its superfile's term dictionary for its
-        // lifetime, so materializing them all here made the pass scale with
-        // table size rather than with the work it does.
-        //
-        // No background fills: this pass reads dictionaries and df headers
-        // only, and a fill here copies EVERY superfile — including
-        // compaction's fresh multi-GiB outputs — into the disk cache. On real
-        // object storage those fills outlive the optimize call and their
-        // reads bleed into whatever runs next (they surfaced as phantom
-        // user-data GETs in cold measurements that began while a fill was
-        // still draining).
-        let bytes = term_stats::build(entries, |entry| {
-            let store = Arc::clone(&store);
-            let disk_cache = disk_cache.clone();
-            let opt_storage = opt_storage.clone();
-            let entry = Arc::clone(entry);
-            async move {
-                open_reader(
-                    &store,
-                    disk_cache.as_ref(),
-                    opt_storage.as_ref(),
-                    &entry,
-                    ReadIntent::Stream,
-                )
+    stamp_with_retries(inner, &storage, "term-stats", |old| {
+        let storage = Arc::clone(&storage);
+        async move {
+            // Every live superfile, parts included: a lazily loaded
+            // manifest's flat view holds only what has been loaded.
+            let entries = old
+                .get_all_superfiles_loaded()
                 .await
-                .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            // One superfile is its own global statistics: a query gathers
+            // df from that superfile's dictionary — the same numbers, one
+            // probe — so publishing an artifact would only duplicate the
+            // dictionary on disk. Nothing to drop either: a commit that
+            // removed the other superfiles already dropped the reference
+            // (the carry rule), and the next multi-superfile maintenance
+            // pass republishes.
+            if entries.len() <= 1 {
+                return Ok(None);
             }
-        })
-        .await
-        .map_err(|e| BuildError::Store(e.to_string()))?;
-        let reference = term_stats::write(storage.as_ref(), bytes)
+            let store = Arc::clone(&old.options.store);
+            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+            // Readers are opened by `build`, one at a time, and dropped
+            // before the next: each pins its superfile's term dictionary
+            // for its lifetime, so materializing them all here made the
+            // pass scale with table size rather than with the work it does.
+            //
+            // No background fills: this pass reads dictionaries and df
+            // headers only, and a fill here copies EVERY superfile —
+            // including compaction's fresh multi-GiB outputs — into the
+            // disk cache. On real object storage those fills outlive the
+            // optimize call and their reads bleed into whatever runs next
+            // (they surfaced as phantom user-data GETs in cold measurements
+            // that began while a fill was still draining).
+            let bytes = term_stats::build(&entries, |entry| {
+                let store = Arc::clone(&store);
+                let disk_cache = disk_cache.clone();
+                let opt_storage = opt_storage.clone();
+                let entry = Arc::clone(entry);
+                async move {
+                    open_reader(
+                        &store,
+                        disk_cache.as_ref(),
+                        opt_storage.as_ref(),
+                        &entry,
+                        ReadIntent::Stream,
+                    )
+                    .await
+                    .map_err(|e| term_stats::TermStatsError::Build(e.to_string()))
+                }
+            })
             .await
             .map_err(|e| BuildError::Store(e.to_string()))?;
-        if old.term_stats_blob() == Some(&reference) {
-            return Ok(());
-        }
-        let new_manifest = old.with_term_stats(reference);
-        let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
-        match new_manifest
-            .write(storage.as_ref(), prev_etag.as_deref(), &[])
-            .await
-        {
-            Ok(()) => {
-                inner.manifest.store(Arc::new(new_manifest));
-                return Ok(());
+            let reference = term_stats::write(storage.as_ref(), bytes)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if old.term_stats_blob() == Some(&reference) {
+                return Ok(None);
             }
-            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
-                next_id_floor = next_id_floor.max(
-                    refresh_and_orphaned_id_floor(inner, &storage, attempted_id)
-                        .await
-                        .map_err(|e| BuildError::Store(e.to_string()))?,
-                );
-                sleep(backoff_delay(attempt)).await;
-            }
-            Err(e) => return Err(BuildError::Store(e.to_string())),
+            Ok(Some(old.with_term_stats(reference)))
         }
-    }
-    Err(BuildError::Store(
-        "term-stats publish lost every commit race".into(),
-    ))
+    })
+    .await
 }
+
+/// Build and publish the table-level term index over the CURRENT
+/// membership, stamping its root reference on a successor manifest (see
+/// `manifest::term_index`). Maintenance-only: optimize calls it after
+/// compaction so the base segment describes the post-merge superfile set.
+/// Readers are opened one at a time and each superfile's terms are
+/// spilled before the next opens, so the pass costs one superfile's
+/// open-time state plus one slice, whatever the table's size.
+///
+/// Every posting carries the term's score ceiling in that superfile, at the
+/// superfile's own statistics; the query rescales it.
+pub(in crate::supertable) async fn stamp_term_index(
+    inner: &SupertableInner,
+) -> Result<(), BuildError> {
+    let Some(storage) = inner.options.storage.clone() else {
+        return Ok(());
+    };
+    if inner.options.fts_columns.is_empty() {
+        return Ok(());
+    }
+    stamp_with_retries(inner, &storage, "term-index", |old| {
+        let storage = Arc::clone(&storage);
+        async move {
+            let entries = old
+                .get_all_superfiles_loaded()
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if entries.is_empty() {
+                return Ok(None);
+            }
+            let store = Arc::clone(&old.options.store);
+            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
+            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
+            let built = collect_and_build_term_index(
+                &store,
+                disk_cache.as_ref(),
+                opt_storage.as_ref(),
+                &entries,
+            )
+            .await
+            .map_err(|e| BuildError::Store(e.to_string()))?;
+            let reference = term_index::write_built(storage.as_ref(), built)
+                .await
+                .map_err(|e| BuildError::Store(e.to_string()))?;
+            if old.term_index_ref() == Some(&reference) {
+                return Ok(None);
+            }
+            Ok(Some(old.with_term_index(reference)))
+        }
+    })
+    .await
+}
+
+/// Walk every superfile's dictionary once, spilling a contribution per
+/// superfile into one scratch directory, then merge them into slices. The
+/// scratch directory goes with the contributions when this returns.
+async fn collect_and_build_term_index(
+    store: &Arc<dyn SuperfileReaderCache>,
+    disk_cache: Option<&Arc<DiskCacheStore>>,
+    opt_storage: Option<&Arc<dyn StorageProvider>>,
+    entries: &[Arc<SuperfileEntry>],
+) -> Result<term_index::Built, TermIndexError> {
+    let scratch = tempfile::Builder::new()
+        .prefix("infino-term-index-")
+        .tempdir()?;
+    let mut contributions = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
+            .await
+            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+        let mut writer = term_index::ContributionWriter::create(
+            scratch.path(),
+            entry.superfile_id,
+            entry.id_min,
+        )?;
+        write_superfile_terms(&reader, &mut writer).await?;
+        contributions.push(writer.finish()?);
+        drop(reader);
+    }
+    term_index::build(&contributions, &term_index::BuildPolicy::default())
+}
+
+/// Terms per batched dictionary read during the term-index build.
+const TERM_INDEX_BATCH_TERMS: usize = 4096;
 
 /// Publish/refresh the slow-CAS serving state (Commit B, "settle").
 ///
@@ -9515,11 +9899,12 @@ pub(in crate::supertable) async fn stamp_term_stats(
 /// present with a matching population key and reuses it (a no-op).
 pub(in crate::supertable) async fn stamp_slow_vector_state(
     inner: &SupertableInner,
-    // When false, skip the O(N) centroid-router fanout GT scan
-    // (`build_and_publish_centroid_router_section`) and carry the prior fanout /
-    // router section forward; the cheap membership publish still runs. The
-    // drain-tail settle passes false (compaction re-settles and calibrates), and
-    // compaction passes it per the caller's RecalibratePolicy (Skip -> false).
+    // When false, skip building + publishing the centroid-router section
+    // (`build_and_publish_centroid_router_section`) and carry the prior router
+    // section forward; the cheap membership publish still runs. The drain-tail
+    // settle passes false (compaction re-settles), and compaction passes it per
+    // the caller's RecalibratePolicy (Skip -> false). The router `fanout_for_k`
+    // is stamped separately, by the compaction recalibration scan.
     calibrate_fanout: bool,
     pending_drain: Option<slow_vector_state::PendingDrainState>,
 ) -> Result<(), BuildError> {
@@ -9528,20 +9913,15 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
     };
     let max_retries = inner.options.max_commit_retries.max(1);
     let mut next_id_floor: u64 = 0;
-    // Cache the built centroid-router ref AND the measured router fanout across
-    // CAS retries, keyed by the published centroid-section URI (a content hash
-    // over this membership + centroids). Reuse it while that key is unchanged;
-    // if a retry reloads a manifest whose membership moved, the key differs and
-    // the section is rebuilt (and the fanout re-measured) for the new
-    // membership. Caching the fanout matters: its measurement is a full
-    // recall sweep over the resident codes — far too costly to repeat per CAS
-    // retry. Both inner `Option`s are absent when the router is off or a step
-    // failed.
-    #[allow(clippy::type_complexity)]
+    // Cache the built centroid-router ref across CAS retries, keyed by the
+    // published centroid-section URI (a content hash over this membership +
+    // centroids). Reuse it while that key is unchanged; if a retry reloads a
+    // manifest whose membership moved, the key differs and the section is
+    // rebuilt for the new membership. The inner `Option` is absent when the
+    // router is off or a step failed.
     let mut centroid_graph_ref: Option<(
         String,
         Option<crate::supertable::manifest::list::RoutingRef>,
-        Option<[u32; crate::supertable::manifest::list::WIDTH_LAW_KS.len()]>,
     )> = None;
     for attempt in 0..max_retries {
         let old = inner.manifest.load_full();
@@ -9603,22 +9983,18 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
         // covered THIS membership — reuse it; absent means build it now. Gated
         // on the router being enabled and best-effort: a `None` just leaves the
         // ref unstamped and queries reconstruct the router in memory.
-        let (centroid_graph, measured_fanout) = match &centroid_graph_ref {
-            Some((key, resolved, fanout)) if *key == published.centroids.uri => {
-                (resolved.clone(), *fanout)
-            }
+        let centroid_graph = match &centroid_graph_ref {
+            Some((key, resolved)) if *key == published.centroids.uri => resolved.clone(),
             _ => {
-                let (resolved, fanout) = match old.slow_vector_state_centroid_graph_blob() {
+                let resolved = match old.slow_vector_state_centroid_graph_blob() {
                     // A present ref means a prior no-op settle already built the
-                    // router (and stamped its fanout) for THIS membership —
-                    // reuse it, re-measure nothing.
-                    Some(existing) => (Some(existing.clone()), None),
-                    // Fanout calibration gated off (bulk-ingest drain-tail, or a
-                    // Skip-policy compaction): skip the O(N) full-corpus fanout
-                    // GT scan and leave the ref unstamped (queries reconstruct the
-                    // router in memory; the prior fanout law carries forward). A
-                    // later Force/Auto settle measures it once.
-                    None if !calibrate_fanout => (None, None),
+                    // router for THIS membership — reuse it.
+                    Some(existing) => Some(existing.clone()),
+                    // Router-section build gated off (bulk-ingest drain-tail, or a
+                    // Skip-policy compaction): leave the ref unstamped, and queries
+                    // reconstruct the router in memory. A later Force/Auto settle
+                    // publishes it.
+                    None if !calibrate_fanout => None,
                     None => {
                         build_and_publish_centroid_router_section(
                             inner,
@@ -9630,35 +10006,20 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
                         .await
                     }
                 };
-                centroid_graph_ref =
-                    Some((published.centroids.uri.clone(), resolved.clone(), fanout));
-                (resolved, fanout)
+                centroid_graph_ref = Some((published.centroids.uri.clone(), resolved.clone()));
+                resolved
             }
         };
-        // A freshly measured fanout is stamped independently of the section blob
-        // (it is computed before the blob is written, so a section-write failure
-        // leaves `centroid_graph = None` while the fanout still changed). Treat
-        // "the measured fanout already matches what's stamped" as part of the
-        // no-op condition, so a changed fanout is never dropped by the
-        // short-circuit even when the section blob is unchanged.
-        let fanout_already_stamped = match measured_fanout {
-            None => true,
-            Some(fanout) => matches!(
-                old.get_partition_strategy(),
-                PartitionStrategy::VectorCell { routing, .. }
-                    if routing.fanout_for_k == fanout
-            ),
-        };
         // No-op only when NOTHING changed — routing blob, centroid section, the
-        // resolved graph ref, the centroid-router section, and the stamped
-        // fanout all already match.
+        // resolved graph ref, and the centroid-router section all already match.
+        // The router `fanout_for_k` is stamped by the compaction recalibration on
+        // its single ground-truth scan, not here.
         if let Some((cur_uri, cur_hash)) = old.slow_vector_state_blob()
             && cur_uri == published.uri
             && cur_hash == published.content_hash
             && old.slow_vector_state_centroids_blob() == Some(&published.centroids)
             && old.resident_vector_index_blob() == graphs_ref.as_ref()
             && old.slow_vector_state_centroid_graph_blob() == centroid_graph.as_ref()
-            && fanout_already_stamped
         {
             return Ok(());
         }
@@ -9669,30 +10030,6 @@ pub(in crate::supertable) async fn stamp_slow_vector_state(
             graphs_ref,
             centroid_graph,
         );
-        // Stamp the measured-recall router fanout into this same settle commit,
-        // beside the centroid-router section it was measured against. Only a
-        // fresh section build produces `Some` (a reused ref carried its fanout
-        // forward), so this rewrites `CellRoutingParams::fanout_for_k` exactly
-        // when the router was (re)built for this membership — the sanctioned
-        // second manifest update for a value only measurable post-commit.
-        let new_manifest = match measured_fanout {
-            Some(fanout) => match new_manifest.get_partition_strategy() {
-                PartitionStrategy::VectorCell {
-                    column,
-                    clusters,
-                    mut routing,
-                } => {
-                    routing.fanout_for_k = fanout;
-                    new_manifest.with_partition_strategy(PartitionStrategy::VectorCell {
-                        column,
-                        clusters,
-                        routing,
-                    })
-                }
-                _ => new_manifest,
-            },
-            None => new_manifest,
-        };
         let attempted_id = new_manifest.get_manifest_id();
         let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&old))
             .await
@@ -9889,10 +10226,12 @@ pub(in crate::supertable) async fn persist_commit_async(
     mut pending_storage_writes: Vec<(String, Bytes)>,
     mut pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
+    term_contributions: Vec<TermContribution>,
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     let storage_async = Arc::clone(&storage);
     let opts = Arc::clone(&inner.options);
     let max_retries = opts.max_commit_retries.max(1);
+    let contributions: &[TermContribution] = &term_contributions;
     let drive = async move {
         let mut last_err: Option<SupertableCommitError> = None;
         let mut next_id_floor: u64 = 0;
@@ -9925,6 +10264,7 @@ pub(in crate::supertable) async fn persist_commit_async(
                 NewEntryBirthVersions::StampCommit,
                 pending_writes,
                 pending_replaces,
+                contributions,
             )
             .await
             {
@@ -9951,6 +10291,9 @@ pub(in crate::supertable) async fn persist_commit_async(
     // would serialize the `tokio::join!` in `commit` (the user + hidden publishes
     // are meant to overlap) and risk a nested-block_on panic. The sync→async
     // bridge lives only in the `persist_commit` wrapper below.
+    // The contributions' spill files go with them when this returns,
+    // whatever the outcome. A failed commit's postings are rebuilt from the
+    // superfile by the next maintenance pass.
     drive.await
 }
 
@@ -9962,6 +10305,7 @@ pub(in crate::supertable) fn persist_commit(
     pending_storage_writes: Vec<(String, Bytes)>,
     pending_storage_replaces: Vec<(String, Bytes)>,
     list_metadata: CommitListMetadata,
+    term_contributions: Vec<TermContribution>,
 ) -> Result<(), SupertableCommitError> {
     let drive = persist_commit_async(
         inner,
@@ -9971,6 +10315,7 @@ pub(in crate::supertable) fn persist_commit(
         pending_storage_writes,
         pending_storage_replaces,
         list_metadata,
+        term_contributions,
     );
     let new_manifest = bridge_on_runtime(drive, &inner.query_runtime())?;
     inner.manifest.store(Arc::new(new_manifest));
@@ -10227,6 +10572,7 @@ pub(crate) async fn try_commit_attempt(
     birth_versions: NewEntryBirthVersions,
     pending_storage_writes: &mut Vec<(String, Bytes)>,
     pending_storage_replaces: &mut Vec<(String, Bytes)>,
+    term_contributions: &[TermContribution],
 ) -> Result<ManifestSnapshot, SupertableCommitError> {
     // 1. Write each new superfile's bytes to storage in parallel.
     write_superfile_list(
@@ -10307,7 +10653,82 @@ pub(crate) async fn try_commit_attempt(
     //    writer runs — so an absent pointer is not an initial commit but a
     //    table dropped and purged under this handle, and the read refuses
     //    rather than republishing one from stale state.
-    let prev_etag = get_current_manifest_etag(&storage, current_manifest).await?;
+    let prev_etag = get_current_manifest_etag(&storage, Arc::clone(&current_manifest)).await?;
+
+    // 3b. The term index: this commit's superfiles publish their postings
+    //     in the SAME CAS as their entries — a delta segment appended to
+    //     the root the current manifest references (which `update` carried
+    //     forward), then the new root's reference on this successor. So a
+    //     visible superfile always has postings, and a crash between these
+    //     writes and the CAS leaves only orphans for GC. On a lost CAS the
+    //     retry rebuilds against the winner's root; the slices are
+    //     content-addressed, so their re-PUTs are no-ops.
+    //
+    //     Runs after the pointer fence above so a purged table refuses the
+    //     commit before any artifact is written. A prior root that cannot
+    //     be loaded is not fatal to the commit — membership is the commit's
+    //     job, routing is derived. A root that is gone or corrupt restarts
+    //     the index from this commit's superfiles alone, marked incomplete;
+    //     a read that merely failed keeps the reference and the segments it
+    //     has accumulated, and marks the index incomplete because this
+    //     commit's superfiles are not listed. A maintenance rebuild makes
+    //     either whole.
+    //
+    //     The index is complete only while it lists every live superfile.
+    //     A commit that publishes a superfile without postings (a path that
+    //     built no contribution) leaves it incomplete, so part selection
+    //     keeps its summary-based choice instead of trusting an index that
+    //     would never route to that superfile.
+    let contributed: HashSet<Uuid> = term_contributions.iter().map(|c| c.superfile_id).collect();
+    let every_new_covered = new_entries
+        .iter()
+        .all(|e| contributed.contains(&e.superfile_id));
+    // The prior root: loaded, absent (no index yet, or gone for good), or
+    // unreadable for now.
+    let mut unreadable_prior: Option<RoutingRef> = None;
+    let prior = match current_manifest.term_index_ref() {
+        Some(reference) if !term_contributions.is_empty() => {
+            match term_index::load_root(storage.as_ref(), reference).await {
+                Ok(root) => Some(root),
+                Err(e) if e.object_is_gone_or_corrupt() => {
+                    warn!(error = %e, uri = %reference.uri, "prior term-index root gone or corrupt; restarting the index from this commit");
+                    None
+                }
+                Err(e) => {
+                    warn!(error = %e, uri = %reference.uri, "prior term-index root unreadable for now; keeping it and marking the index incomplete");
+                    unreadable_prior = Some(reference.clone());
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    if let Some(reference) = unreadable_prior {
+        new_manifest = new_manifest.with_term_index_ref(reference, false);
+    } else if !term_contributions.is_empty() {
+        // A delta on top of a complete index stays complete; the first
+        // index on a table that already held superfiles covers only this
+        // commit's, and stays incomplete until a maintenance rebuild.
+        let complete = every_new_covered
+            && match prior.is_some() {
+                true => current_manifest.term_index_complete(),
+                false => current_manifest.holds_no_superfiles(),
+            };
+        let reference = term_index::append_delta(
+            storage.as_ref(),
+            prior,
+            term_contributions,
+            &term_index::BuildPolicy::default(),
+        )
+        .await
+        .map_err(|e| BuildError::Store(e.to_string()))?;
+        new_manifest = new_manifest.with_term_index_ref(reference, complete);
+    } else if !every_new_covered
+        && current_manifest.term_index_complete()
+        && let Some(reference) = current_manifest.term_index_ref()
+    {
+        new_manifest = new_manifest.with_term_index_ref(reference.clone(), false);
+    }
 
     // 4. Parallel-issue (touched parts) + list PUTs, then
     //    conditional pointer PUT (the visibility barrier).
@@ -10580,6 +11001,40 @@ pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
         put_superfile_multipart(storage, path, bytes).await
     } else {
         storage.put_atomic(path, bytes).await.map(|_| ())
+    }
+}
+
+/// Objects at or above this size go through the multipart upload path.
+/// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
+/// content hash — slow-vector state, term statistics, term-index slices
+/// and roots — can grow past that at scale; the figure matches the
+/// superfile default.
+pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
+    100 * 1024 * 1024;
+
+/// Persist `bytes` under the name `uri_for` derives from their content
+/// hash and return the reference a manifest records. Idempotent: an
+/// object that already exists under its hash name is the same bytes, so
+/// the store's `PreconditionFailed` is success.
+pub(in crate::supertable) async fn put_content_addressed(
+    storage: &dyn StorageProvider,
+    uri_for: impl FnOnce(&part_mod::ContentHash) -> String,
+    bytes: Vec<u8>,
+) -> Result<RoutingRef, StorageError> {
+    let content_hash = part_mod::ContentHash::of(&bytes);
+    let uri = uri_for(&content_hash);
+    match put_bytes_multipart_or_atomic(
+        storage,
+        &uri,
+        Bytes::from(bytes),
+        CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES,
+    )
+    .await
+    {
+        Ok(()) | Err(StorageError::PreconditionFailed { .. }) => {
+            Ok(RoutingRef { uri, content_hash })
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -11023,6 +11478,7 @@ mod tests {
                 bytes_for_store: None,
                 bytes_for_storage: Some((uri.storage_path(), bytes)),
                 bytes_for_cache: None,
+                term_contribution: None,
             },
         )
     }

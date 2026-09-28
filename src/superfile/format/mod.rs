@@ -152,7 +152,7 @@ pub mod fts {
     /// the df=1 inline form already uses.
     ///
     /// The term dictionary is no longer an FST: it is sorted,
-    /// front-coded term blocks behind a first-key index (`fts::dict`),
+    /// front-coded term blocks behind a first-key index (`utils::terms`),
     /// whose entries carry the short/long form explicitly and the
     /// metadata offset as a delta — a third smaller than the FST for
     /// the same terms. Readers select the layout by this version;
@@ -168,6 +168,46 @@ pub mod fts {
     ///
     /// Readers accept `V1`–`V7`.
     pub const VERSION_V7: u32 = 7;
+
+    /// The version new code writes when a superfile's documents are
+    /// stored in the FTS blob under an ordering of their own. Byte for
+    /// byte the [`VERSION_V7`] layout for every term, block, skip entry
+    /// and dictionary value; what it adds is one region, the **doc-id
+    /// map**. Its header is the [`VERSION_V7`] header unchanged: the
+    /// map is the last region before the doc-lengths directory and its
+    /// size follows from the document count, so where it begins is
+    /// arithmetic and needs no field of its own.
+    ///
+    /// Through `V7` an FTS doc id *is* a Parquet row index, so postings
+    /// are ordered by arrival. `V8` separates the two: postings are
+    /// ordered by whatever grouping the writer chose, and the map gives
+    /// the row a doc id belongs to, one `u32` per document followed by a
+    /// CRC. Compaction uses this to place documents that share terms
+    /// next to each other, which shortens posting deltas and narrows the
+    /// id span a block covers, without moving a single Parquet row: row
+    /// groups keep the statistics arrival order gave them, the vector
+    /// blob keeps its own ordering, and the table stays time ordered.
+    ///
+    /// The map is the whole of the difference. A reader that has it can
+    /// serve a `V8` blob; the search kernels never see it, because they
+    /// work in the blob's own id space throughout and the ids are
+    /// translated once, on the way out. The region sits between the
+    /// positions region and the doc-lengths directory, and the open-time
+    /// tail fetch starts at the map rather than at the directory, so the
+    /// two arrive in one range read instead of two.
+    ///
+    /// One thing a caller can observe changes, and it is not a bug: a
+    /// top-k breaks equal scores by the blob's own doc id, so a `V8`
+    /// blob and a `V7` blob of the same documents can name different
+    /// rows among a group that scores identically. Both are correct
+    /// rankings and every returned row carries the score its rank
+    /// claims; which of several tied documents is chosen is not part of
+    /// the ordering the scorer defines, and reordering is precisely a
+    /// change to the id that breaks the tie.
+    ///
+    /// Readers accept `V1`–`V8`. Nothing older carries a map and nothing
+    /// older needs one, since for those blobs the identity is the map.
+    pub const VERSION_V8: u32 = 8;
 
     /// Stride of the position run-offset sub-index ([`VERSION_V3`]): one
     /// stored offset per this many pairs within a posting block. A decode
@@ -335,16 +375,10 @@ pub mod fts {
         Compact,
     }
 
-    /// How the term dictionary lays its terms out — by blob version.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum DictLayout {
-        /// `V1`–`V6`: one FST keyed `column <SEP> term`, values packed as
-        /// `fts::fst_value` describes.
-        Fst,
-        /// `V7`+: front-coded term blocks behind a fixed-width first-key
-        /// table (see `fts::dict`).
-        Blocks,
-    }
+    /// How the term dictionary lays its terms out — by blob version. The
+    /// enum lives with the dictionary code it selects (`utils::terms`); it
+    /// is re-exported here because it is part of the blob layout table.
+    pub use crate::utils::terms::DictLayout;
 
     /// Everything a blob version decides about how its regions are laid
     /// out — the one table the writer (by the era it writes) and the
@@ -404,7 +438,10 @@ pub mod fts {
                     bitset_blocks: true,
                     ..legacy
                 },
-                VERSION_V7 => Self {
+                // `V8` adds a region and a header field, nothing that
+                // changes how a term, block, skip entry or dictionary
+                // value is laid out, so it reads as `V7` does.
+                VERSION_V7 | VERSION_V8 => Self {
                     coarse: true,
                     short_form: true,
                     grouped_positions: true,
@@ -418,6 +455,18 @@ pub mod fts {
                 _ => return None,
             })
         }
+    }
+
+    /// Bytes of fixed header a blob of `version` carries, or `None` for
+    /// a version this crate does not know. One place so the writer's
+    /// assembly and the reader's parse cannot drift.
+    pub fn header_size(version: u32) -> Option<usize> {
+        Some(match version {
+            VERSION_V1_LEGACY => HEADER_SIZE_V1_LEGACY,
+            VERSION_V2 | VERSION_V3 | VERSION_V4 | VERSION_V5 | VERSION_V6 | VERSION_V7
+            | VERSION_V8 => HEADER_SIZE_V2,
+            _ => return None,
+        })
     }
 
     /// How a term's skip table locates its blocks — by blob version.
@@ -824,27 +873,11 @@ pub(crate) const ID_SIDECAR_ENTRY_BYTES: usize = size_of::<i128>();
 /// internal namespace separate even if we add more KV keys later.
 pub const RESERVED_PREFIX: &str = "inf.";
 
-/// Little-endian `u32` at `at`, `None` past the end of `bytes`.
-#[inline]
-pub(crate) fn u32_le_at(bytes: &[u8], at: usize) -> Option<u32> {
-    bytes
-        .get(at..at + 4)
-        .map(|s| u32::from_le_bytes(s.try_into().expect("4 bytes")))
-}
-
-/// Little-endian `u64` at `at`, `None` past the end of `bytes`.
-#[inline]
-pub(crate) fn u64_le_at(bytes: &[u8], at: usize) -> Option<u64> {
-    bytes
-        .get(at..at + 8)
-        .map(|s| u64::from_le_bytes(s.try_into().expect("8 bytes")))
-}
-
-/// Reserved separator byte inside FST keys (`<column>\x1F<term>`). User
-/// column names must not contain this byte. ASCII Unit Separator (U+001F)
-/// is below every printable ASCII char so prefix iteration over a column's
-/// terms works correctly via FST range scan.
-pub const FST_SEPARATOR: u8 = 0x1F;
+pub(crate) use crate::utils::bytes::{u32_le_at, u64_le_at};
+/// The key separator is owned by the term dictionary (`utils::terms`) and
+/// re-exported here because the format layer validates column names
+/// against it.
+pub use crate::utils::terms::FST_SEPARATOR;
 
 /// Parsed (major, minor, patch) representation of a semver string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -918,7 +951,29 @@ mod tests {
         assert_eq!(v7.skip, SkipLayout::Length);
         assert_eq!(v7.dict, DictLayout::Blocks);
         assert_eq!(v7.doc_length_bytes, fts::DOC_LENGTH_BYTES_V7);
-        assert_eq!(BlobLayout::for_version(fts::VERSION_V7 + 1), None);
+        // `V8` adds a region and a header field, not a posting layout,
+        // so it reads exactly as `V7` does.
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V8), Some(v7));
+        assert_eq!(BlobLayout::for_version(fts::VERSION_V8 + 1), None);
+
+        // Header size is the one thing `V8` does move, and the helper is
+        // the single place the writer and the reader read it from.
+        assert_eq!(
+            fts::header_size(fts::VERSION_V1_LEGACY),
+            Some(fts::HEADER_SIZE_V1_LEGACY)
+        );
+        for v in [
+            fts::VERSION_V2,
+            fts::VERSION_V3,
+            fts::VERSION_V4,
+            fts::VERSION_V5,
+            fts::VERSION_V6,
+            fts::VERSION_V7,
+        ] {
+            assert_eq!(fts::header_size(v), Some(fts::HEADER_SIZE_V2), "v{v}");
+        }
+        assert_eq!(fts::header_size(fts::VERSION_V8), Some(fts::HEADER_SIZE_V2));
+        assert_eq!(fts::header_size(fts::VERSION_V8 + 1), None);
         assert_eq!(BlobLayout::for_version(0), None);
     }
 
