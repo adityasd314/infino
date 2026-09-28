@@ -2019,9 +2019,7 @@ impl SuperfileBuilder {
         let body = body_encoder.finish()?;
         let ids_bytes: &[u8] = if ids_ok { &id_sidecar_bytes } else { &[] };
         superfile_builder.finish_to_with_body(body, ids_bytes, output)?;
-
         drop(finish_span);
-
         Ok(SuperfileStats::from_children(stats_collector.as_slice()))
     }
 
