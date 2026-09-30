@@ -173,8 +173,10 @@ pub mod fts {
     /// stored in the FTS blob under an ordering of their own. Byte for
     /// byte the [`VERSION_V7`] layout for every term, block, skip entry
     /// and dictionary value; what it adds is one region, the **doc-id
-    /// map**, and the header field at [`hdr::DOC_MAP_OFFSET_OFF`] that
-    /// locates it.
+    /// map**. Its header is the [`VERSION_V7`] header unchanged: the
+    /// map is the last region before the doc-lengths directory and its
+    /// size follows from the document count, so where it begins is
+    /// arithmetic and needs no field of its own.
     ///
     /// Through `V7` an FTS doc id *is* a Parquet row index, so postings
     /// are ordered by arrival. `V8` separates the two: postings are
@@ -472,10 +474,8 @@ pub mod fts {
     pub fn header_size(version: u32) -> Option<usize> {
         Some(match version {
             VERSION_V1_LEGACY => HEADER_SIZE_V1_LEGACY,
-            VERSION_V2 | VERSION_V3 | VERSION_V4 | VERSION_V5 | VERSION_V6 | VERSION_V7 => {
-                HEADER_SIZE_V2
-            }
-            VERSION_V8 => HEADER_SIZE_V8,
+            VERSION_V2 | VERSION_V3 | VERSION_V4 | VERSION_V5 | VERSION_V6 | VERSION_V7
+            | VERSION_V8 => HEADER_SIZE_V2,
             _ => return None,
         })
     }
@@ -983,7 +983,7 @@ mod tests {
         ] {
             assert_eq!(fts::header_size(v), Some(fts::HEADER_SIZE_V2), "v{v}");
         }
-        assert_eq!(fts::header_size(fts::VERSION_V8), Some(fts::HEADER_SIZE_V8));
+        assert_eq!(fts::header_size(fts::VERSION_V8), Some(fts::HEADER_SIZE_V2));
         assert_eq!(fts::header_size(fts::VERSION_V8 + 1), None);
         assert_eq!(BlobLayout::for_version(0), None);
     }

@@ -6,10 +6,10 @@
 //! Every input's dictionary is in term order, so a k-way merge over the
 //! inputs' dictionaries yields the output terms in final order, with no
 //! corpus-sized accumulator; peak memory is one term's postings across all
-//! inputs. When the remaps keep arrival order, a term's postings joined in
-//! input order are already sorted by output doc id. When the merge chooses
-//! a doc order of its own, or an input stores one, they are not, and that
-//! one term's postings are sorted before they are emitted.
+//! inputs. When every remap rises, a term's postings joined in input order
+//! are already sorted by output doc id. When one does not (the merge chose
+//! its own doc order, or an input stores its docs under one), that one
+//! term's postings are sorted before they are emitted.
 //!
 //! The walk over the dictionaries and the writes stay in term order on one
 //! thread. Between them, each batch of terms is read, sorted and encoded in
@@ -20,8 +20,6 @@ use std::{
     collections::BinaryHeap,
     io::Error,
     iter::once,
-    marker::PhantomData,
-    mem,
     ops::Range,
     str::from_utf8,
     sync::{Arc, Mutex, PoisonError},
@@ -29,7 +27,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use rayon::prelude::*;
+use rayon::{current_num_threads, prelude::*};
 
 use crate::{
     superfile::{
@@ -37,10 +35,7 @@ use crate::{
         fts::{positions::TermRuns, reader::FtsReader},
         id_space::FtsDocId,
     },
-    utils::{
-        terms::FstValue,
-        trace::{Stopwatch, record},
-    },
+    utils::terms::FstValue,
 };
 
 /// Terms each input cursor reads from its dictionary at a time.
@@ -50,19 +45,33 @@ pub(crate) const TERMS_PER_CHUNK: usize = 4096;
 /// cross a batch boundary at every kind of term they build.
 const BATCH_TERMS: usize = if cfg!(test) { 3 } else { 1 << 16 };
 
-/// Most posting bytes in one batch, as the dictionary's length hints
-/// count them, so a batch of very common terms stays bounded in memory. A
-/// term larger than this is a batch of its own.
-const BATCH_POSTING_BYTES: u64 = if cfg!(test) { 256 } else { 64 << 20 };
+/// Most postings in one batch, so its decoded postings stay bounded in
+/// memory whatever the thread count: about 40 bytes each while merged,
+/// plus 4 per position. A term with more postings is a batch of its own.
+const BATCH_POSTINGS: u64 = if cfg!(test) { 1_200 } else { 1 << 24 };
 
-/// Terms one parallel task takes, so it takes a worker's scratch once per
-/// few hundred terms rather than once per term.
+/// Most terms one parallel task takes, so it takes a worker's scratch once
+/// per few hundred terms rather than once per term. Small under test, so
+/// a task on one thread takes several terms of a tiny batch.
 const TASK_TERMS: usize = if cfg!(test) { 2 } else { 256 };
+
+/// Tasks each thread gets from a batch, at least, when the batch has
+/// enough terms. A small batch, such as one of very common terms, is still
+/// spread over every thread. One under test, with [`TASK_TERMS`].
+const TASKS_PER_THREAD: usize = if cfg!(test) { 1 } else { 4 };
+
+/// Most bytes a worker's merge buffers may keep between terms. A worker
+/// that merged a larger term drops them, so a few very common terms do not
+/// leave every worker holding buffers of their size. The caller's state
+/// is not counted; it trims its own. Tiny under test, so
+/// the merge tests drop them after their long terms.
+const KEEP_WORK_BYTES: usize = if cfg!(test) { 1 << 10 } else { 16 << 20 };
 
 /// One merge input: a superfile and where its rows land in the output.
 pub(crate) struct SortedInput {
     pub(crate) reader: Arc<SuperfileReader>,
-    /// Input blob doc id → output doc id; `None` drops the row.
+    /// The output blob doc id each of this input's own doc ids becomes;
+    /// `None` drops the row. Output ids must be unique across all inputs.
     pub(crate) remap: Vec<Option<FtsDocId>>,
 }
 
@@ -73,23 +82,16 @@ pub(crate) struct SortedInput {
 /// position run, decoded (empty for a non-positional column).
 ///
 /// `encode` runs on many threads at once, each call with a worker state
-/// from `states`, grown with `new_state` as needed; `write` runs on this
-/// thread, once per term, in term order. The states are handed back in
-/// `states`, so the caller can fold what they gathered.
-///
-/// Under `detailed-tracing`, records where the time went on the enclosing
-/// span: `dict_ms` and `write_ms` on this thread and `parallel_ms` for the
-/// batches' wall time; `read_ms`, `sort_ms` and `encode_ms` summed across
-/// threads; plus the `postings`, `term_inputs`, `sorted_terms`,
-/// `sorted_postings` and `run_values` counts.
+/// made by `new_state`; `write` runs on this thread, once per term, in term
+/// order. Returns the worker states, so the caller can fold what they
+/// gathered.
 pub(crate) fn merge_column<S: Send, T: Send>(
     inputs: &[SortedInput],
     column_id: u32,
-    states: &mut Vec<S>,
     new_state: impl Fn() -> S + Sync,
     encode: impl Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
     mut write: impl FnMut(&str, T) -> Result<(), BuildError>,
-) -> Result<(), BuildError> {
+) -> Result<Vec<S>, BuildError> {
     let readers = inputs
         .iter()
         .map(|input| input.reader.fts().ok_or(BuildError::BatchReadError))
@@ -115,41 +117,25 @@ pub(crate) fn merge_column<S: Send, T: Send>(
         readers: &readers,
         inputs,
         column_id,
-        workers: Mutex::new(
-            mem::take(states)
-                .into_iter()
-                .map(|s| (TermWork::default(), s))
-                .collect(),
-        ),
+        workers: Mutex::new(Vec::new()),
         new_state: &new_state,
         encode: &encode,
-        output: PhantomData,
     };
-    let mut dict = Stopwatch::default();
-    let mut parallel = Stopwatch::default();
-    let mut write_time = Stopwatch::default();
-    let mut n_term_inputs = 0u64;
     let mut batch = Batch::default();
-    loop {
-        let started = Stopwatch::start();
-        let Some(Reverse((term, first))) = heap.pop() else {
-            dict.stop(started);
-            break;
-        };
-        let term_start = batch.term_bytes.len();
-        batch.term_bytes.extend_from_slice(&term);
-        let inputs_start = batch.inputs.len();
+    // The current term's inputs, gathered before it joins a batch.
+    let mut term_inputs: Vec<(usize, FstValue)> = Vec::new();
+    while let Some(Reverse((term, first))) = heap.pop() {
+        term_inputs.clear();
+        let mut term_postings = 0u64;
         let mut next_input = Some(first);
         while let Some(i) = next_input {
             let value = values[i].ok_or(BuildError::BatchReadError)?;
-            batch.inputs.push((i, value));
-            if let FstValue::Pfor {
-                postings_length_hint: Some(len),
-                ..
-            } = value
-            {
-                batch.posting_bytes += u64::from(len);
-            }
+            term_inputs.push((i, value));
+            term_postings += u64::from(
+                readers[i]
+                    .term_postings_at_most(value)
+                    .map_err(read_error)?,
+            );
             let next = cursors[i].next().map_err(read_error)?;
             values[i] = next.as_ref().map(|(_, value)| *value);
             if let Some((next_term, _)) = next {
@@ -160,40 +146,39 @@ pub(crate) fn merge_column<S: Send, T: Send>(
                 _ => None,
             };
         }
-        n_term_inputs += (batch.inputs.len() - inputs_start) as u64;
+        // A term that would take the batch past its postings starts a new one.
+        if !batch.terms.is_empty() && batch.postings + term_postings > BATCH_POSTINGS {
+            work.run(&batch, &mut write)?;
+            batch.clear();
+        }
+        let term_start = batch.term_bytes.len();
+        batch.term_bytes.extend_from_slice(&term);
+        let inputs_start = batch.inputs.len();
+        batch.inputs.extend_from_slice(&term_inputs);
+        batch.postings += term_postings;
         batch.terms.push(PendingTerm {
             term: term_start..batch.term_bytes.len(),
             inputs: inputs_start..batch.inputs.len(),
         });
-        dict.stop(started);
-        if batch.terms.len() >= BATCH_TERMS || batch.posting_bytes >= BATCH_POSTING_BYTES {
-            work.run(&batch, &mut parallel, &mut write_time, &mut write)?;
+        if batch.terms.len() >= BATCH_TERMS || batch.postings >= BATCH_POSTINGS {
+            work.run(&batch, &mut write)?;
             batch.clear();
         }
     }
-    work.run(&batch, &mut parallel, &mut write_time, &mut write)?;
+    work.run(&batch, &mut write)?;
 
-    let workers = work
+    Ok(work
         .workers
         .into_inner()
-        .unwrap_or_else(PoisonError::into_inner);
-    let mut totals = TermWork::default();
-    for (w, _) in &workers {
-        totals.absorb(w);
-    }
-    *states = workers.into_iter().map(|(_, s)| s).collect();
-    record("dict_ms", dict.ms());
-    record("parallel_ms", parallel.ms());
-    record("write_ms", write_time.ms());
-    record("read_ms", totals.read.ms());
-    record("sort_ms", totals.sort.ms());
-    record("encode_ms", totals.encode.ms());
-    record("postings", totals.n_postings);
-    record("term_inputs", n_term_inputs);
-    record("sorted_terms", totals.n_sorted_terms);
-    record("sorted_postings", totals.n_sorted_postings);
-    record("run_values", totals.n_run_values);
-    Ok(())
+        .unwrap_or_else(PoisonError::into_inner)
+        .into_iter()
+        .map(|(_, s)| s)
+        .collect())
+}
+
+/// Terms per task for a batch of `n_terms`.
+fn task_terms(n_terms: usize) -> usize {
+    (n_terms / (current_num_threads() * TASKS_PER_THREAD)).clamp(1, TASK_TERMS)
 }
 
 /// One term waiting in a batch: where its bytes and its inputs'
@@ -210,7 +195,7 @@ struct Batch {
     term_bytes: Vec<u8>,
     /// `(input, that input's dictionary value)` for every term's inputs.
     inputs: Vec<(usize, FstValue)>,
-    posting_bytes: u64,
+    postings: u64,
 }
 
 impl Batch {
@@ -218,46 +203,34 @@ impl Batch {
         self.terms.clear();
         self.term_bytes.clear();
         self.inputs.clear();
-        self.posting_bytes = 0;
+        self.postings = 0;
     }
 }
 
-/// One worker's buffers for merging a term, and what it has measured.
+/// One worker's buffers for merging a term.
 #[derive(Default)]
 struct TermWork {
     postings: Vec<(u32, u32)>,
-    /// Every posting's run values back to back, and where each run starts.
-    /// A sort reorders the starts and leaves the values where they are.
     runs: Vec<u32>,
+    /// Where each posting's run starts in `runs`.
     run_starts: Vec<usize>,
     positions_buf: Vec<u32>,
-    sorted_postings: Vec<(u32, u32)>,
-    sorted_starts: Vec<usize>,
-    /// Decoding and remapping; sorting a term whose postings arrive out of
-    /// order; and encoding.
-    read: Stopwatch,
-    sort: Stopwatch,
-    encode: Stopwatch,
-    n_postings: u64,
-    n_sorted_terms: u64,
-    n_sorted_postings: u64,
-    n_run_values: u64,
+    sort_scratch: SortScratch,
 }
 
 impl TermWork {
-    fn absorb(&mut self, other: &TermWork) {
-        self.read.add(&other.read);
-        self.sort.add(&other.sort);
-        self.encode.add(&other.encode);
-        self.n_postings += other.n_postings;
-        self.n_sorted_terms += other.n_sorted_terms;
-        self.n_sorted_postings += other.n_sorted_postings;
-        self.n_run_values += other.n_run_values;
+    /// Bytes the buffers hold on to.
+    fn capacity_bytes(&self) -> usize {
+        self.postings.capacity() * size_of::<(u32, u32)>()
+            + self.runs.capacity() * size_of::<u32>()
+            + self.run_starts.capacity() * size_of::<usize>()
+            + self.positions_buf.capacity() * size_of::<u32>()
+            + self.sort_scratch.capacity_bytes()
     }
 }
 
 /// What every batch of one column's merge shares.
-struct BatchWork<'a, S, T, N, E> {
+struct BatchWork<'a, S, N, E> {
     readers: &'a [&'a FtsReader],
     inputs: &'a [SortedInput],
     column_id: u32,
@@ -265,34 +238,23 @@ struct BatchWork<'a, S, T, N, E> {
     workers: Mutex<Vec<(TermWork, S)>>,
     new_state: &'a N,
     encode: &'a E,
-    /// What `encode` returns.
-    output: PhantomData<fn() -> T>,
 }
 
-impl<S, T, N, E> BatchWork<'_, S, T, N, E>
-where
-    S: Send,
-    T: Send,
-    N: Fn() -> S + Sync,
-    E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
-{
+impl<S: Send, N: Fn() -> S + Sync, E> BatchWork<'_, S, N, E> {
     /// Merge a batch's terms in parallel, then write them in term order.
-    fn run(
+    fn run<T: Send>(
         &self,
         batch: &Batch,
-        parallel: &mut Stopwatch,
-        write_time: &mut Stopwatch,
         write: &mut impl FnMut(&str, T) -> Result<(), BuildError>,
-    ) -> Result<(), BuildError> {
-        let started = Stopwatch::start();
+    ) -> Result<(), BuildError>
+    where
+        E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError> + Sync,
+    {
         let merged = batch
             .terms
-            .par_chunks(TASK_TERMS)
+            .par_chunks(task_terms(batch.terms.len()))
             .map(|chunk| self.merge_chunk(batch, chunk))
             .collect::<Result<Vec<_>, _>>()?;
-        parallel.stop(started);
-
-        let started = Stopwatch::start();
         for (pending, output) in batch.terms.iter().zip(merged.into_iter().flatten()) {
             let term = from_utf8(&batch.term_bytes[pending.term.clone()])
                 .map_err(|_| BuildError::Io(Error::other("fts sorted merge: non-utf8 term")))?;
@@ -301,16 +263,18 @@ where
                 write(term, output)?;
             }
         }
-        write_time.stop(started);
         Ok(())
     }
 
     /// Merge some consecutive terms of a batch on one worker.
-    fn merge_chunk(
+    fn merge_chunk<T>(
         &self,
         batch: &Batch,
         chunk: &[PendingTerm],
-    ) -> Result<Vec<Option<T>>, BuildError> {
+    ) -> Result<Vec<Option<T>>, BuildError>
+    where
+        E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError>,
+    {
         let taken = self
             .workers
             .lock()
@@ -323,7 +287,11 @@ where
             .map(|pending| {
                 let term = &batch.term_bytes[pending.term.clone()];
                 let inputs = &batch.inputs[pending.inputs.clone()];
-                self.merge_term(term, inputs, &mut work, &mut state)
+                let merged = self.merge_term(term, inputs, &mut work, &mut state);
+                if work.capacity_bytes() > KEEP_WORK_BYTES {
+                    work = TermWork::default();
+                }
+                merged
             })
             .collect();
         self.workers
@@ -336,20 +304,22 @@ where
     /// Read one term's postings from its inputs, remapped to output doc
     /// ids, sort them if they arrive out of order, and encode them. `None`
     /// when every posting was deleted.
-    fn merge_term(
+    fn merge_term<T>(
         &self,
         term: &[u8],
         term_inputs: &[(usize, FstValue)],
         work: &mut TermWork,
         state: &mut S,
-    ) -> Result<Option<T>, BuildError> {
-        let started = Stopwatch::start();
+    ) -> Result<Option<T>, BuildError>
+    where
+        E: Fn(&mut S, &[(u32, u32)], TermRuns<'_>) -> Result<T, BuildError>,
+    {
         let TermWork {
             postings,
             runs,
             run_starts,
             positions_buf,
-            ..
+            sort_scratch,
         } = work;
         postings.clear();
         runs.clear();
@@ -364,6 +334,10 @@ where
                     positions_buf,
                     |_, doc, tf, pos| {
                         if let Some(out_doc) = remap[doc as usize] {
+                            debug_assert!(
+                                pos.is_empty() || pos.len() == tf as usize,
+                                "sorted merge: a position run must hold tf positions"
+                            );
                             let out_doc = out_doc.get();
                             ascending &= postings.last().is_none_or(|&(d, _)| d < out_doc);
                             postings.push((out_doc, tf));
@@ -375,41 +349,58 @@ where
                 )
                 .map_err(read_error)?;
         }
-        work.read.stop(started);
-        if work.postings.is_empty() {
+        if postings.is_empty() {
             return Ok(None);
         }
-        work.n_postings += work.postings.len() as u64;
-        work.n_run_values += work.runs.len() as u64;
-
-        let (pairs, starts) = match ascending {
-            true => (&work.postings, &work.run_starts),
-            false => {
-                // Sort this term's postings by output doc id, taking each
-                // posting's run start with it.
-                work.n_sorted_terms += 1;
-                work.n_sorted_postings += work.postings.len() as u64;
-                let started = Stopwatch::start();
-                let mut order: Vec<usize> = (0..work.postings.len()).collect();
-                order.sort_unstable_by_key(|&k| work.postings[k].0);
-                work.sorted_postings.clear();
-                work.sorted_starts.clear();
-                for k in order {
-                    work.sorted_postings.push(work.postings[k]);
-                    work.sorted_starts.push(work.run_starts[k]);
-                }
-                work.sort.stop(started);
-                (&work.sorted_postings, &work.sorted_starts)
-            }
+        let starts = match ascending {
+            true => run_starts.as_slice(),
+            false => sort_scratch.sort(postings, run_starts),
         };
-        let started = Stopwatch::start();
-        let runs = TermRuns::Values {
-            values: &work.runs,
+        debug_assert!(
+            postings.is_sorted_by(|a, b| a.0 < b.0),
+            "sorted merge: output doc ids must be unique"
+        );
+        let term_runs = TermRuns::Values {
+            values: runs,
             starts,
         };
-        let output = (self.encode)(state, pairs, runs)?;
-        work.encode.stop(started);
-        Ok(Some(output))
+        (self.encode)(state, postings, term_runs).map(Some)
+    }
+}
+
+/// Reused buffers for sorting one term's postings by output doc id.
+#[derive(Default)]
+struct SortScratch {
+    /// `(output_doc_id, tf, run_start)` per posting.
+    entries: Vec<(u32, u32, usize)>,
+    /// The run starts in sorted order.
+    starts: Vec<usize>,
+}
+
+impl SortScratch {
+    /// Sort `postings` in place by doc id and return `run_starts` in the
+    /// same order. Only the starts move; the run values stay where they are.
+    fn sort(&mut self, postings: &mut [(u32, u32)], run_starts: &[usize]) -> &[usize] {
+        self.entries.clear();
+        self.entries.extend(
+            postings
+                .iter()
+                .zip(run_starts)
+                .map(|(&(doc, tf), &start)| (doc, tf, start)),
+        );
+        self.entries.sort_unstable_by_key(|e| e.0);
+        self.starts.clear();
+        for (slot, &(doc, tf, start)) in postings.iter_mut().zip(&self.entries) {
+            *slot = (doc, tf);
+            self.starts.push(start);
+        }
+        &self.starts
+    }
+
+    /// Bytes the buffers hold on to.
+    fn capacity_bytes(&self) -> usize {
+        self.entries.capacity() * size_of::<(u32, u32, usize)>()
+            + self.starts.capacity() * size_of::<usize>()
     }
 }
 

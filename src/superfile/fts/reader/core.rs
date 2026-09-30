@@ -53,7 +53,7 @@ use crate::{
             builder::{DOC_LENGTHS_ENTRY_SIZE, TERM_META_SIZE},
             positions::{GroupIndex, decode_run},
             posting::{BLOCK_LEN, ENCODING_BITSET, decode_block_doc_ids},
-            short::decode_short,
+            short::{SHORT_MAX_DF, decode_short},
             tokenize::{Phrase, Tokenizer},
         },
         id_space::{DocMap, FtsDocId, RowId},
@@ -580,14 +580,14 @@ impl FtsReader {
         // Length of the FTS subsection itself (≈ `kv::FTS_LENGTH`), not
         // the whole superfile: `source` is the FTS-scoped sub-source.
         let fts_blob_len = source.size() as usize;
-        // One GET covers every header size: any real FTS blob is larger
-        // than the widest header (header + FST CRC + postings CRC + a
-        // non-empty doc-lengths directory), so fetching the widest span
-        // up front costs no extra round-trip on a narrower one and saves
-        // one on the widest. Sized off the largest rather than a
-        // particular version, because a header short of what the version
-        // declares cannot be parsed and there is no second fetch here.
-        let header_fetch = format::fts::HEADER_SIZE_V8.min(fts_blob_len);
+        // One GET covers every header size: every version's header is
+        // this wide, `V8` included, because the doc-id map's position is
+        // derived from the document count rather than stored in a field
+        // of its own. Fetching a byte more would overfetch, and eight
+        // spare bytes are enough to break the coalesced group a cold
+        // query's reads form -- the same bytes then arrive as two
+        // requests instead of one.
+        let header_fetch = format::fts::HEADER_SIZE_V2.min(fts_blob_len);
         let header = fetch_lazy_range(source.as_ref(), 0..header_fetch, "fts header").await?;
         if header.len() < FTS_HEADER_SIZE {
             return Err(FtsError::Read(ReadError::MissingKv("fts header")));
@@ -741,18 +741,17 @@ impl FtsReader {
 
         // The doc-id map region, `VERSION_V8` only: one `u32` per document
         // giving the Parquet row that document's postings belong to, then
-        // a CRC. It sits between the positions region and the doc-lengths
-        // directory, so on a blob that has one the positions region ends
-        // where the map begins rather than at the directory.
+        // a CRC. It is the last thing before the doc-lengths directory,
+        // and its size follows from the document count, so where it
+        // starts is arithmetic rather than a field: the directory offset
+        // less the map's own length. That keeps every version's header
+        // the same width, which is what lets a cold open read one header
+        // span and no more.
+        let doc_map_len = (n_docs as usize)
+            .saturating_mul(U32_BYTES)
+            .saturating_add(format::CRC_BYTES);
         let doc_map_offset: Option<usize> = match version == format::fts::VERSION_V8 {
-            true => {
-                let ext = fetch_source_range(
-                    &source,
-                    format::fts::HEADER_SIZE_V2..format::fts::HEADER_SIZE_V8,
-                    "fts header doc-map ext",
-                )?;
-                Some(read_u64_le(&ext[0..U64_BYTES]) as usize)
-            }
+            true => Some(doc_lengths_table_offset.saturating_sub(doc_map_len)),
             false => None,
         };
 
@@ -998,11 +997,14 @@ impl FtsReader {
             None => DocMap::Identity,
             Some(mo) => {
                 let body_end = doc_lengths_table_offset.saturating_sub(format::CRC_BYTES);
-                let expect = (n_docs as usize) * U32_BYTES;
-                if body_end < mo || body_end - mo != expect {
+                // The map's start is derived, so it cannot disagree with
+                // its length; what a corrupt header can still do is put
+                // the directory too early for a map of this many
+                // documents to fit between it and the regions before it.
+                if doc_lengths_table_offset < doc_map_len {
                     return Err(FtsError::Read(ReadError::MalformedVersion(format!(
-                        "fts doc-map is {} bytes for {n_docs} docs, expected {expect}",
-                        body_end.saturating_sub(mo)
+                        "fts doc-map of {doc_map_len} bytes for {n_docs} docs does not fit \
+                         below the doc-lengths directory at {doc_lengths_table_offset}"
                     ))));
                 }
                 let body = fetch_source_range(&source, mo..body_end, "fts/doc-map")?;
@@ -1121,6 +1123,24 @@ impl FtsReader {
         fetch_source_range(&self.source, self.fst_range.clone(), "fts/dict")
     }
 
+    /// Most postings the term at `value` holds: exact for a long term,
+    /// read from its header, and the form's limit for a short one.
+    pub(crate) fn term_postings_at_most(&self, value: FstValue) -> Result<u32, FtsError> {
+        match value {
+            FstValue::Inline { .. } => Ok(1),
+            FstValue::Pfor { short: true, .. } => Ok(SHORT_MAX_DF as u32),
+            FstValue::Pfor {
+                metadata_offset, ..
+            } => {
+                let start =
+                    self.postings_range.start + metadata_offset as usize + term_meta::DF_OFF;
+                let df =
+                    fetch_source_range(&self.source, start..start + U32_BYTES, "fts/merge df")?;
+                Ok(read_u32_le(&df))
+            }
+        }
+    }
+
     /// Open the term dictionary over fetched FST bytes, mapping an FST
     /// parse failure to the reader's malformed-blob error.
     pub(super) fn open_dict<'b>(&self, fst_bytes: &'b [u8]) -> Result<TermDict<'b>, FtsError> {
@@ -1151,13 +1171,13 @@ impl FtsReader {
         if col.norms_loaded() {
             return Ok(());
         }
-        let n = col.n_docs as usize;
-        let array_len = n * col.doc_length_bytes;
-        let start = col.doc_lengths_range.start;
-        // The array plus its CRC, checked when verification is on.
+        // The array plus its CRC, checked when verification is on. The
+        // range is the open path's, bounded against the blob there; a source
+        // that answers short errors (`ShortRead`) rather than handing up a
+        // truncated buffer, so the slice below is within what came back.
         let array = self
             .source
-            .range_async(start..start + array_len + 4)
+            .range_async(col.array_with_crc_range())
             .await
             .map_err(|e| {
                 FtsError::Read(ReadError::MalformedVersion(format!(
@@ -1165,7 +1185,7 @@ impl FtsReader {
                 )))
             })?;
         col.check_array_crc(&array)?;
-        let norms = col.norms_from_array(&array[..array_len]);
+        let norms = col.norms_from_array(&array[..col.array_len()]);
         // A concurrent prewarm may have won; either set is the same table.
         let _ = col.base_norms.set(norms);
         Ok(())
@@ -2214,10 +2234,20 @@ mod tests {
             );
         }
     }
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet},
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
 
     use async_trait::async_trait;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use tokio::{
+        spawn,
+        sync::Notify,
+        task::spawn_blocking,
+        time::{sleep, timeout},
+    };
 
     use super::{super::test_util::*, *};
     use crate::superfile::{
@@ -2603,17 +2633,13 @@ mod tests {
         );
         FtsReader::open(Bytes::from(blob.clone()), json).expect("the fixture opens clean");
 
-        let map_off =
-            read_u64_le(&blob[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES])
-                as usize;
         let dls_off =
             read_u64_le(&blob[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES])
                 as usize;
-        assert_eq!(
-            dls_off - map_off,
-            N_DOCS as usize * U32_BYTES + 4,
-            "the region is one entry per document plus its checksum"
-        );
+        // Where the map starts is derived, not stored: the directory
+        // offset less one entry per document and the region's checksum.
+        let map_len = N_DOCS as usize * U32_BYTES + format::CRC_BYTES;
+        let map_off = dls_off - map_len;
 
         // A flipped byte inside the region.
         let mut flipped = blob.clone();
@@ -2630,16 +2656,15 @@ mod tests {
             "expected a doc-map checksum failure, got {err:?}"
         );
 
-        // A moved region boundary. The map's own length check is the
-        // backstop here rather than the first line of defence: moving
-        // where it starts also moves where the region before it ends, so
-        // that region's checksum is what fails. Either way the file is
-        // refused rather than read with the boundary the header claims.
-        let mut moved_start = blob.clone();
-        let moved = (map_off + U32_BYTES) as u64;
-        moved_start[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
-            .copy_from_slice(&moved.to_le_bytes());
-        let err = FtsReader::open(Bytes::from(moved_start), json).expect_err("moved map");
+        // A moved directory. Deriving the map's start from the directory
+        // means moving the directory moves the map with it, so the bytes
+        // read as the map are no longer the bytes written as one and its
+        // checksum fails. Nothing is read at the boundary the header
+        // claims without being checked first.
+        let mut moved_dir = blob.clone();
+        moved_dir[hdr::DOC_LENGTHS_DIR_OFF..hdr::DOC_LENGTHS_DIR_OFF + U64_BYTES]
+            .copy_from_slice(&((dls_off - U32_BYTES) as u64).to_le_bytes());
+        let err = FtsReader::open(Bytes::from(moved_dir), json).expect_err("moved directory");
         assert!(
             matches!(
                 err,
@@ -2649,16 +2674,13 @@ mod tests {
             "expected the moved boundary to be refused, got {err:?}"
         );
 
-        // A header claiming the map starts where the doc-lengths
-        // directory does leaves no room for one entry per document. The
-        // offsets are range-checked before anything is sliced, so that
-        // check is what refuses it, and the length check behind it is
-        // the backstop for a header that passes the range test with a
-        // region still the wrong size.
-        let mut empty_map = blob.clone();
-        empty_map[hdr::DOC_MAP_OFFSET_OFF..hdr::DOC_MAP_OFFSET_OFF + U64_BYTES]
-            .copy_from_slice(&(dls_off as u64).to_le_bytes());
-        let err = FtsReader::open(Bytes::from(empty_map), json).expect_err("empty map");
+        // A document count the region cannot hold. The map's size comes
+        // from it, so inflating it claims a region larger than the blob
+        // has room for below the directory.
+        let mut huge_docs = blob.clone();
+        huge_docs[hdr::N_DOCS_OFF..hdr::N_DOCS_OFF + U32_BYTES]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let err = FtsReader::open(Bytes::from(huge_docs), json).expect_err("impossible map");
         assert!(
             matches!(err, FtsError::Read(ReadError::MalformedVersion(_))),
             "expected a malformed-header failure, got {err:?}"
@@ -3831,13 +3853,7 @@ mod tests {
         let r = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
             .await
             .expect("open_lazy");
-        // The open fetches one header span sized off the widest header
-        // there is, so on a blob whose header is narrower the span
-        // necessarily carries the first few dictionary bytes with it --
-        // in the same GET, at no extra round-trip. What is under test is
-        // that the open does not fetch the dictionary, so the probe
-        // region is the dictionary past that span.
-        let dictionary = r.fst_range.start.max(format::fts::HEADER_SIZE_V8)..r.fst_range.end;
+        let dictionary = r.fst_range.clone();
         let lengths = r.columns[0].doc_lengths_range.clone();
         let opened = recording.len();
         assert_eq!(
@@ -3995,6 +4011,233 @@ mod tests {
             .search("body", &["rust"], 10, BoolMode::Or)
             .await
             .expect("search over lazy reader");
+        let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
+        assert!(ids.contains(&0) && ids.contains(&1));
+    }
+
+    /// How long the second of two racing searches may take while the first
+    /// is held on its read: far above a search over three documents.
+    const RACING_SEARCH_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// Poll cadence while waiting for a paused read to be reached.
+    const PAUSE_POLL: Duration = Duration::from_millis(5);
+
+    /// A whole-blob source that serves bytes only asynchronously, the way
+    /// an object store does, and parks the first read touching `region`
+    /// until told to go on.
+    struct PausingSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+        paused: AtomicBool,
+        resume: Notify,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for PausingSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                self.paused.store(true, Ordering::SeqCst);
+                self.resume.notified().await;
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A lazy reader over a [`PausingSource`] parked on the column's length
+    /// array, armed after the open so only a query's read of the array
+    /// pauses; the source is returned so a test can watch and release it.
+    async fn reader_pausing_on_the_length_array() -> (Arc<PausingSource>, Arc<FtsReader>) {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(PausingSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            resume: Notify::new(),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = Arc::new(
+            FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+                .await
+                .expect("open_lazy"),
+        );
+        source.armed.store(true, Ordering::SeqCst);
+        (source, reader)
+    }
+
+    /// Two scored single-term searches racing on a cold column: the second
+    /// completes while the first is still waiting for the length array.
+    ///
+    /// The single-term path used to reach the norms through the synchronous
+    /// fallback, whose initializer held the norms cell's lock across the
+    /// read, so the second search parked on that lock — a thread, and on an
+    /// `infino-io` worker the core the read needed — for as long as the
+    /// read took. Two workers, so a parked one is visible. This pins the
+    /// prewarm on the single-term path; the fallback's own lock behaviour
+    /// is pinned below.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cold_scored_search_does_not_hold_a_racing_one_on_the_norms() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
+
+        let first = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        // Bounded: a reader that stopped reading the array on a scored
+        // search would otherwise wait here forever instead of failing.
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first scored search must read the length array");
+        let second = {
+            let reader = Arc::clone(&reader);
+            spawn(async move { reader.search("body", &["rust"], 10, BoolMode::Or).await })
+        };
+        let second_done = timeout(RACING_SEARCH_DEADLINE, second).await;
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        let first_hits = first
+            .await
+            .expect("first search task")
+            .expect("first search");
+        let second_hits = second_done
+            .expect("the second search must not wait on the first search's read")
+            .expect("second search task")
+            .expect("second search");
+        let first_ids: HashSet<u32> = first_hits.iter().map(|(d, _)| d.get()).collect();
+        let second_ids: HashSet<u32> = second_hits.iter().map(|(d, _)| d.get()).collect();
+        assert_eq!(first_ids, second_ids);
+        assert!(first_ids.contains(&0) && first_ids.contains(&1));
+    }
+
+    /// Two threads reaching a cold column's norms through the synchronous
+    /// fallback itself, the first parked on its read: the second returns
+    /// while the first is still parked, because the read runs outside the
+    /// cell. This is the assertion that fails if the read ever moves back
+    /// inside `get_or_init`, where the initializer's lock would hold the
+    /// second thread for as long as the first's read takes; the racing
+    /// search above no longer reaches the fallback, so it cannot tell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_fallback_read_does_not_hold_a_racing_one() {
+        let (source, reader) = reader_pausing_on_the_length_array().await;
+        let fallback = |reader: Arc<FtsReader>| {
+            spawn_blocking(move || {
+                reader.columns[0].norms();
+            })
+        };
+
+        let first = fallback(Arc::clone(&reader));
+        timeout(RACING_SEARCH_DEADLINE, async {
+            while !source.paused.load(Ordering::SeqCst) {
+                sleep(PAUSE_POLL).await;
+            }
+        })
+        .await
+        .expect("the first fallback must read the length array");
+        let second = timeout(RACING_SEARCH_DEADLINE, fallback(Arc::clone(&reader))).await;
+        let first_still_parked = !first.is_finished();
+        // Release the first read before asserting, so a failure leaves no
+        // thread parked behind it.
+        source.resume.notify_one();
+        first.await.expect("first fallback task");
+        second
+            .expect("the second fallback must not wait on the first's read")
+            .expect("second fallback task");
+        assert!(
+            first_still_parked,
+            "the first read was still parked when the second returned"
+        );
+        assert!(
+            reader.columns[0].norms_loaded(),
+            "either read fills the cell; both are the same table"
+        );
+    }
+
+    /// A whole-blob source whose first read touching `region` fails the
+    /// way a truncated object does, and serves every read after it.
+    struct FailingOnceSource {
+        inner: BytesLazyByteSource,
+        region: Range<usize>,
+        armed: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LazyByteSource for FailingOnceSource {
+        fn size(&self) -> u64 {
+            self.inner.size()
+        }
+
+        async fn range(&self, start: u64, len: u64) -> Result<Bytes, LazyByteSourceError> {
+            let touches =
+                (start as usize) < self.region.end && (start + len) as usize > self.region.start;
+            if touches && self.armed.swap(false, Ordering::SeqCst) {
+                return Err(LazyByteSourceError::ShortRead {
+                    start,
+                    requested: len,
+                    got: 0,
+                });
+            }
+            self.inner.range(start, len).await
+        }
+
+        fn try_get_range_sync(&self, _start: u64, _len: u64) -> Option<Bytes> {
+            None
+        }
+    }
+
+    /// A length-array read that fails in the synchronous fallback scores
+    /// that call against the empty table and leaves the column's cell
+    /// empty, so the next read fills it: the failure is not what every
+    /// later query on the reader scores against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_fallback_read_of_the_norms_is_not_cached() {
+        let (blob, json) = build_blob();
+        let eager = FtsReader::open(blob.clone(), &json).expect("eager open");
+        let lengths = eager.columns[0].doc_lengths_range.clone();
+        let source = Arc::new(FailingOnceSource {
+            inner: BytesLazyByteSource::new(blob),
+            region: lengths,
+            armed: AtomicBool::new(false),
+        });
+        let src: Arc<dyn LazyByteSource> = source.clone();
+        let reader = FtsReader::open_lazy(src, &json, OpenOptions::for_object_store())
+            .await
+            .expect("open_lazy");
+        // Armed after the open, so the first read of the array is the
+        // fallback's.
+        source.armed.store(true, Ordering::SeqCst);
+        let column = &reader.columns[0];
+
+        // The fallback survives the failure without publishing it.
+        let _empty = column.norms();
+        assert!(
+            !column.norms_loaded(),
+            "a failed read must not fill the norms cell"
+        );
+
+        // The next scoring entry point reads the array again, and scores.
+        let hits = reader
+            .search("body", &["rust"], 10, BoolMode::Or)
+            .await
+            .expect("search after the failed read");
+        assert!(column.norms_loaded(), "the retry must fill the norms cell");
         let ids: HashSet<u32> = hits.iter().map(|(d, _)| d.get()).collect();
         assert!(ids.contains(&0) && ids.contains(&1));
     }
