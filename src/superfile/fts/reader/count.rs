@@ -406,11 +406,11 @@ impl FtsReader {
 
     /// Up to `limit` of `column`'s terms after `after` (from the first when
     /// `None`), in term order, each with what [`Self::term_index_facts`]
-    /// records for it. Walks the dictionary with its values, so no term is
-    /// looked up again, and gives a df=1 inline term its fact straight from
-    /// its entry: its one posting's score is its bound, so no cursor is
-    /// built. `fst_bytes` is this reader's dictionary, fetched once by the
-    /// caller.
+    /// records for it. Walks the dictionary with its values, avoiding a
+    /// separate term lookup for each entry.A df=1 inline term gets its fact
+    /// straight from its entry: its one posting's score is its bound, so no
+    /// cursor is built. `fst_bytes` is this reader's dictionary, fetched
+    /// once by the caller.
     pub(crate) async fn term_index_facts_after(
         &self,
         fst_bytes: &[u8],

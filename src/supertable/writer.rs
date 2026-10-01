@@ -3080,17 +3080,7 @@ pub(in crate::supertable) fn build_term_contribution(
 /// dictionary yields its terms sorted, so the contribution is in the
 /// ascending key order the merge requires. A superfile with no text index
 /// contributes no terms but is still listed by the index.
-#[cfg_attr(
-    feature = "detailed-tracing",
-    tracing::instrument(
-        skip_all,
-        fields(
-            terms = tracing::field::Empty,
-            facts_ms = tracing::field::Empty,
-            push_ms = tracing::field::Empty,
-        )
-    )
-)]
+#[cfg_attr(feature = "detailed-tracing", tracing::instrument(skip_all))]
 async fn write_superfile_terms(
     reader: &SuperfileReader,
     writer: &mut term_index::ContributionWriter,
