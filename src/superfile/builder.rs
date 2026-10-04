@@ -84,7 +84,7 @@ use arrow_array::{Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatc
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
-use tempfile::{NamedTempFile, tempfile};
+use tempfile::NamedTempFile;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
@@ -2921,8 +2921,8 @@ impl SuperfileBuilder {
             self.opts.row_group_size,
             &id_page_limit,
         )?;
-
-        let mut vector_file = tempfile().map_err(BuildError::Io)?;
+        let scratch_root = scratch_root();
+        let mut vector_file = tempfile::tempfile_in(&scratch_root).map_err(BuildError::Io)?;
         finish_multi_cell_blob_to(cells, BufWriter::new(&mut vector_file))?;
         let vector_length = vector_file.seek(SeekFrom::End(0)).map_err(BuildError::Io)?;
         vector_file

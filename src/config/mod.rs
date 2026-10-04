@@ -35,7 +35,7 @@
 
 use std::{
     collections::HashMap,
-    env, fmt,
+    env, fmt, fs,
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::OnceLock,
@@ -1627,7 +1627,9 @@ impl Config {
     fn validate(&self) -> Result<(), ConfigError> {
         // Create scratch root directory if it doesn't exist
         if let Some(path) = self.storage.scratch_root.as_deref() {
-            std::fs::create_dir_all(path).expect("Scratch Root Directory should exist");
+            fs::create_dir_all(path).map_err(|e| {
+                ConfigError::Invalid(format!("storage.scratch_root {}: {e}", path.display()))
+            })?;
         }
 
         let v = &self.vector;
@@ -2034,7 +2036,6 @@ storage:
             cfg.storage.disk_cache_root.as_deref(),
             Some(Path::new("/tmp/infino-cache"))
         );
-
         assert_eq!(
             cfg.storage.cold_fetch_mode,
             StorageColdFetchMode::LazyForegroundWithBackgroundFill

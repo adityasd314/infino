@@ -180,9 +180,6 @@ pub enum BuildError {
     /// back. Caller fixes config or schema.
     #[error("partition column missing in schema: {0}")]
     PartitionColumnMissing(String),
-
-    #[error("io error during build: {0}")]
-    Io(#[from] std::io::Error),
 }
 
 impl BuildError {
