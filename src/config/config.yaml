@@ -72,7 +72,6 @@ supertable:
 storage:
   backend: none
   local_root:
-  scratch_root: /opt/private/tmp
   bucket:
   prefix: ""
 
