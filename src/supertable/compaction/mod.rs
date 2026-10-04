@@ -36,8 +36,8 @@ use tracing::{Instrument, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    config::CompactionSettings,
-    runtime_bridge::bridge_on_runtime,
+    config::{CompactionSettings, RecalibratePolicy, scratch_root},
+    runtime_bridge::{bridge_on_runtime, run_on_pool},
     superfile::{
         builder::SuperfileBuilder,
         vector::{cell_posting::transcode_clamped_components, layout::VectorLayout},
@@ -576,15 +576,14 @@ impl Supertable {
                     .map(|c| c.rerank_codec.is_ivf_mergeable())
             });
 
-            let scratch_root = crate::config::scratch_root();
-
+            let scratch_root = scratch_root();
             // Every merge kind streams its output to a temp file and mmaps it
             // back, so the corpus-sized merge output is never held as an anon
             // Vec — the allocation that OOMs compaction on a memory-tight host.
             // Mapped pages are file-backed and reclaimable; downstream publish
             // takes `Bytes` unchanged (large superfiles already stream via
             // put_multipart).
-            let mut output = NamedTempFile::new_in(&scratch_root)
+            let mut output = NamedTempFile::new_in(scratch_root)
                 .map_err(|e| BuildError::Store(format!("merge temp create: {e}")))?;
             let stats = {
                 let mut writer = BufWriter::new(output.as_file_mut());

@@ -24,6 +24,7 @@ use rayon::prelude::*;
 use tempfile::{tempdir, tempdir_in};
 
 use crate::{
+    config::scratch_root,
     superfile::{
         BuildError,
         format::{
@@ -420,7 +421,7 @@ impl ScratchDir {
             let tmp = if let Some(parent) = &self.parent {
                 tempfile::TempDir::new_in(parent)?
             } else {
-                let scratch_root = crate::config::scratch_root();
+                let scratch_root = scratch_root();
                 tempfile::Builder::new()
                     .prefix("infino-vector-")
                     .tempdir_in(scratch_root)?
