@@ -172,8 +172,7 @@ use crate::{
             listed_once, options_hash,
             part::{self as part_mod, PartId},
             superfile_stem,
-            term_index::{self, Contribution as TermContribution, TermIndexError},
-            term_stats,
+            term_index::{self, Contribution as TermContribution, Root, TermIndexError},
         },
         mutations::{
             CommitError, CommitResult, MAX_TARGETS_PER_MUTATION, MutationError, MutationStats,
@@ -185,9 +184,7 @@ use crate::{
             dispatch::{open_compaction_input, open_reader},
             vector::{IndexOutcome, stable_ids_by_local_for_routing},
         },
-        reader_cache::{
-            DiskCacheStore, ReadIntent, SuperfileReaderCache, disk::mmap_readonly_bytes,
-        },
+        reader_cache::{DiskCacheStore, ReadIntent, disk::mmap_readonly_bytes},
         schema::{
             DECIMAL128_PRECISION, DECIMAL128_SCALE, FieldId, LegacyNames, PhysicalSchema,
             TableSchema,
@@ -3431,7 +3428,10 @@ async fn write_superfile_terms(
     let dict_bytes = fts
         .dict_bytes_async()
         .await
-        .map_err(|e| TermIndexError::Build(format!("term walk: {e}")))?;
+        .map_err(|source| TermIndexError::Read {
+            what: "term walk",
+            source,
+        })?;
     for (_, column, column_id) in &columns {
         let mut after: Option<Vec<u8>> = None;
         loop {
@@ -3443,7 +3443,10 @@ async fn write_superfile_terms(
                     TERM_INDEX_BATCH_TERMS,
                 )
                 .await
-                .map_err(|e| TermIndexError::Build(format!("term facts: {e}")))?;
+                .map_err(|source| TermIndexError::Read {
+                    what: "term facts",
+                    source,
+                })?;
             for (term, fact) in &chunk {
                 let term =
                     from_utf8(term).map_err(|_| TermIndexError::Build("non-utf8 term".into()))?;
@@ -10061,7 +10064,7 @@ async fn previous_centroid_section(
 /// deletes. A hash collision only ever costs a spurious reuse/rebuild, not
 /// correctness — the copy-flip and query-time doc-id dedup are the
 /// correctness guards.
-fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
+pub(in crate::supertable) fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
     let entries = manifest.get_all_superfiles();
     let count: u64 = entries.iter().map(|e| e.n_docs).sum();
     let min_id = entries.iter().map(|e| e.id_min).min().unwrap_or(0);
@@ -10091,7 +10094,7 @@ fn resident_index_population_key(manifest: &ManifestSnapshot) -> u64 {
 /// a flat publish logging as a graph publish is the same class of confusion
 /// the reasoned declines exist to remove — the log saying the mode you did not
 /// ask for.
-async fn publish_resident_index(
+pub(in crate::supertable) async fn publish_resident_index(
     storage: &dyn StorageProvider,
     population_key: u64,
     high_water: i128,
@@ -10255,6 +10258,8 @@ async fn build_hnsw_graph_ref(
         && let Some(prior_data) = sections.data.and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
     {
         let prior_count = prior_data.doc_ids.len();
@@ -10331,7 +10336,7 @@ async fn build_hnsw_graph_ref(
 /// (`None` when nothing needs publishing), then CAS it in. A lost race
 /// derives the next attempt past any crash-orphaned list and retries
 /// with backoff; `what` names the artifact in the terminal error.
-async fn stamp_with_retries<F, Fut>(
+pub(in crate::supertable) async fn stamp_with_retries<F, Fut>(
     inner: &SupertableInner,
     storage: &Arc<dyn StorageProvider>,
     what: &str,
@@ -10359,10 +10364,22 @@ where
             return Ok(());
         };
         let attempted_id = new_manifest.get_manifest_id();
-        let prev_etag = get_current_manifest_etag(storage, Arc::clone(&old))
-            .await
-            .inspect_err(|e| inner.note_commit_error(e))
-            .map_err(BuildError::from)?;
+        let prev_etag = match get_current_manifest_etag(storage, Arc::clone(&old)).await {
+            Ok(etag) => etag,
+            // Another commit landed while the successor was built: a lost
+            // race like the one the write reports, so reload and retry.
+            Err(SupertableCommitError::WriteContentionExhausted) if attempt + 1 < max_retries => {
+                refresh_inner_state_async(inner, storage)
+                    .await
+                    .map_err(|e| BuildError::Store(e.to_string()))?;
+                sleep(backoff_delay(attempt)).await;
+                continue;
+            }
+            Err(e) => {
+                inner.note_commit_error(&e);
+                return Err(BuildError::from(e));
+            }
+        };
         match new_manifest
             .write(storage.as_ref(), prev_etag.as_deref(), &[])
             .await
@@ -10388,85 +10405,6 @@ where
     )))
 }
 
-/// Build and publish the term-stats sidecar over the CURRENT
-/// membership, stamping its reference on a successor manifest (see
-/// `manifest::term_stats` for artifact semantics and the carry rule).
-/// Maintenance-only: optimize calls it after compaction settles, so the
-/// artifact always describes the post-merge superfile set. Safe to lose
-/// to contention — queries fall back to the fused query-time gather
-/// until the next maintenance pass republishes.
-pub(in crate::supertable) async fn stamp_term_stats(
-    inner: &SupertableInner,
-) -> Result<(), BuildError> {
-    let Some(storage) = inner.options.storage.clone() else {
-        return Ok(());
-    };
-    if inner.manifest.load().fts_configs().is_empty() {
-        return Ok(());
-    }
-    stamp_with_retries(inner, &storage, "term-stats", |old| {
-        let storage = Arc::clone(&storage);
-        async move {
-            // Every live superfile, parts included: a lazily loaded
-            // manifest's flat view holds only what has been loaded.
-            let entries = old
-                .get_all_superfiles_loaded()
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
-            // One superfile is its own global statistics: a query gathers
-            // df from that superfile's dictionary — the same numbers, one
-            // probe — so publishing an artifact would only duplicate the
-            // dictionary on disk. Nothing to drop either: a commit that
-            // removed the other superfiles already dropped the reference
-            // (the carry rule), and the next multi-superfile maintenance
-            // pass republishes.
-            if entries.len() <= 1 {
-                return Ok(None);
-            }
-            let store = Arc::clone(&old.options.store);
-            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-            // Readers are opened by `build`, one at a time, and dropped
-            // before the next: each pins its superfile's term dictionary
-            // for its lifetime, so materializing them all here made the
-            // pass scale with table size rather than with the work it does.
-            //
-            // No background fills: this pass reads dictionaries and df
-            // headers only, and a fill here copies EVERY superfile —
-            // including compaction's fresh multi-GiB outputs — into the
-            // disk cache. On real object storage those fills outlive the
-            // optimize call and their reads bleed into whatever runs next
-            // (they surfaced as phantom user-data GETs in cold measurements
-            // that began while a fill was still draining).
-            let legacy = old.options.legacy_names();
-            let bytes = term_stats::build(&entries, &legacy, |entry| {
-                let store = Arc::clone(&store);
-                let disk_cache = disk_cache.clone();
-                let opt_storage = opt_storage.clone();
-                let entry = Arc::clone(entry);
-                async move {
-                    open_reader(
-                        &store,
-                        disk_cache.as_ref(),
-                        opt_storage.as_ref(),
-                        &entry,
-                        ReadIntent::Stream,
-                    )
-                    .await
-                    .map_err(term_stats::TermStatsError::Open)
-                }
-            })
-            .await?;
-            let reference = term_stats::write(storage.as_ref(), bytes).await?;
-            if old.term_stats_blob() == Some(&reference) {
-                return Ok(None);
-            }
-            Ok(Some(old.with_term_stats(reference)))
-        }
-    })
-    .await
-}
-
 /// Build and publish the table-level term index over the CURRENT
 /// membership, stamping its root reference on a successor manifest (see
 /// `manifest::term_index`). Maintenance-only: optimize calls it after
@@ -10477,6 +10415,11 @@ pub(in crate::supertable) async fn stamp_term_stats(
 ///
 /// Every posting carries the term's score ceiling in that superfile, at the
 /// superfile's own statistics; the query rescales it.
+///
+/// The full build runs once. When commits land before it publishes, a retry
+/// splices it over their delta segments (`term_index::splice_base`), or,
+/// when that cannot list every live superfile, indexes only the superfiles
+/// the last build lacks on top of it.
 pub(in crate::supertable) async fn stamp_term_index(
     inner: &SupertableInner,
 ) -> Result<(), BuildError> {
@@ -10486,8 +10429,13 @@ pub(in crate::supertable) async fn stamp_term_index(
     if inner.manifest.load().fts_configs().is_empty() {
         return Ok(());
     }
+    // The last build's root, and the root it was built to replace. A retry
+    // reuses its slices without PUTting them again: were one reclaimed in
+    // between, queries would fall back to summary routing until a rebuild.
+    let last_build: Mutex<Option<(Root, Option<Root>)>> = Mutex::new(None);
     stamp_with_retries(inner, &storage, "term-index", |old| {
-        let storage = Arc::clone(&storage);
+        let storage = &storage;
+        let last_build = &last_build;
         async move {
             let entries = old
                 .get_all_superfiles_loaded()
@@ -10496,21 +10444,35 @@ pub(in crate::supertable) async fn stamp_term_index(
             if !old.needs_term_index_rebuild(&entries).await {
                 return Ok(None);
             }
-            let store = Arc::clone(&old.options.store);
-            let disk_cache = old.options.disk_cache.as_ref().map(Arc::clone);
-            let opt_storage = old.options.storage.as_ref().map(Arc::clone);
-            let built = collect_and_build_term_index(
-                &store,
-                disk_cache.as_ref(),
-                opt_storage.as_ref(),
-                &entries,
-                &old.options.legacy_names(),
-            )
-            .await
-            .map_err(|e| BuildError::Store(e.to_string()))?;
-            let reference = term_index::write_built(storage.as_ref(), built)
-                .await
-                .map_err(|e| BuildError::Store(e.to_string()))?;
+            let current = referenced_root(&old).await;
+            let last = last_build.lock().expect("term-index build lock").clone();
+            let spliced = last
+                .as_ref()
+                .and_then(|(base, prior)| {
+                    term_index::splice_base(base, prior.as_ref()?, current.as_ref()?)
+                })
+                .filter(|root| unlisted(root, &entries).is_empty());
+            let root = match spliced {
+                Some(root) => root,
+                None => {
+                    // Everything on the first attempt; after that, only what
+                    // committed since the last build.
+                    let onto = last.map(|(base, _)| base).unwrap_or_default();
+                    let missing = unlisted(&onto, &entries);
+                    // Already lists every live superfile: an empty segment
+                    // would add nothing.
+                    if missing.is_empty() {
+                        onto
+                    } else {
+                        let built = collect_and_build_term_index(&old, &missing, onto).await?;
+                        term_index::write_slices(storage.as_ref(), built.slices).await?;
+                        *last_build.lock().expect("term-index build lock") =
+                            Some((built.root.clone(), current));
+                        built.root
+                    }
+                }
+            };
+            let reference = term_index::write_root(storage.as_ref(), &root).await?;
             // The root is content-addressed, so an unchanged reference can
             // still sit beside a stale "incomplete" mark; this build covers
             // the whole membership, so publish whenever that mark is wrong.
@@ -10523,16 +10485,41 @@ pub(in crate::supertable) async fn stamp_term_index(
     .await
 }
 
+/// The root `manifest` references: empty when it has none, `None` when it
+/// cannot be read. Loaded through the snapshot, which caches it.
+async fn referenced_root(manifest: &ManifestSnapshot) -> Option<Root> {
+    match manifest.term_index_ref() {
+        Some(_) => manifest
+            .term_index()
+            .await
+            .map(|index| index.root().clone()),
+        None => Some(Root::default()),
+    }
+}
+
+/// The `entries` that `root` does not list.
+fn unlisted(root: &Root, entries: &[Arc<SuperfileEntry>]) -> Vec<Arc<SuperfileEntry>> {
+    let listed: HashSet<Uuid> = root.superfiles.iter().copied().collect();
+    entries
+        .iter()
+        .filter(|e| !listed.contains(&e.superfile_id))
+        .cloned()
+        .collect()
+}
+
 /// Walk every superfile's dictionary once, spilling a contribution per
-/// superfile into one scratch directory, then merge them into slices. The
-/// scratch directory goes with the contributions when this returns.
+/// superfile into one scratch directory, then merge them into one segment
+/// on top of `onto`. The scratch directory goes with the contributions when
+/// this returns.
 async fn collect_and_build_term_index(
-    store: &Arc<dyn SuperfileReaderCache>,
-    disk_cache: Option<&Arc<DiskCacheStore>>,
-    opt_storage: Option<&Arc<dyn StorageProvider>>,
+    manifest: &ManifestSnapshot,
     entries: &[Arc<SuperfileEntry>],
-    legacy: &LegacyNames,
+    onto: Root,
 ) -> Result<term_index::Built, TermIndexError> {
+    let store = &manifest.options.store;
+    let disk_cache = manifest.options.disk_cache.as_ref();
+    let opt_storage = manifest.options.storage.as_ref();
+    let legacy = manifest.options.legacy_names();
     let scratch = tempfile::Builder::new()
         .prefix("infino-term-index-")
         .tempdir()?;
@@ -10540,7 +10527,7 @@ async fn collect_and_build_term_index(
     for entry in entries {
         let reader = open_reader(store, disk_cache, opt_storage, entry, ReadIntent::Stream)
             .await
-            .map_err(|e| TermIndexError::Build(e.to_string()))?;
+            .map_err(TermIndexError::Open)?;
         // The walk reads most of the FTS section, whose reads skip the block
         // cache, so each would be its own GET. Fetch the section in bulk first.
         // On failure the walk still works, read by read.
@@ -10555,11 +10542,11 @@ async fn collect_and_build_term_index(
             entry.superfile_id,
             entry.id_min,
         )?;
-        write_superfile_terms(&reader, legacy, &mut writer).await?;
+        write_superfile_terms(&reader, &legacy, &mut writer).await?;
         contributions.push(writer.finish()?);
         drop(reader);
     }
-    term_index::build(&contributions, &term_index::BuildPolicy::default())
+    term_index::build_onto(onto, &contributions, &term_index::BuildPolicy::default())
 }
 
 /// Terms per batch of facts read during the term-index build.
@@ -11684,6 +11671,19 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     storage: &Arc<dyn StorageProvider>,
     attempted_id: u64,
 ) -> Result<u64, SupertableCommitError> {
+    refresh_inner_state_async(inner, storage).await?;
+    let refreshed_id = inner.manifest.load_full().get_manifest_id();
+    Ok(orphaned_id_floor(storage, refreshed_id, attempted_id).await)
+}
+
+/// The probe half of [`refresh_and_orphaned_id_floor`], for a caller that
+/// has already refreshed to `refreshed_id`: the first free id past an
+/// unpublished list at `attempted_id`, or 0 when there is nothing to skip.
+pub(in crate::supertable) async fn orphaned_id_floor(
+    storage: &Arc<dyn StorageProvider>,
+    refreshed_id: u64,
+    attempted_id: u64,
+) -> u64 {
     /// Cap on sequential HEAD probes per retry. A contiguous orphan run
     /// longer than this escapes in chunks — each retry's floor lands on
     /// the first unprobed id and the next collision resumes the walk from
@@ -11692,10 +11692,8 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
     /// its body, so probes are not free).
     const MAX_ORPHAN_RUN_PROBES: u64 = 32;
 
-    refresh_inner_state_async(inner, storage).await?;
-    let refreshed_id = inner.manifest.load_full().get_manifest_id();
     if refreshed_id >= attempted_id {
-        return Ok(0);
+        return 0;
     }
     // Ids above the pointer are only ever held by unpublished lists, so
     // the occupied run starting at `attempted_id` is finite; the floor
@@ -11720,11 +11718,11 @@ pub(in crate::supertable) async fn refresh_and_orphaned_id_floor(
             }
         }
     }
-    Ok(if next_free_id > attempted_id {
+    if next_free_id > attempted_id {
         next_free_id
     } else {
         0
-    })
+    }
 }
 
 /// CAS-publish a successor manifest whose tombstone seq for every
@@ -11857,9 +11855,8 @@ pub(in crate::supertable) async fn put_bytes_multipart_or_atomic(
 
 /// Objects at or above this size go through the multipart upload path.
 /// Azure and S3 cap a single PUT at ~5 GiB, and the artifacts written by
-/// content hash — slow-vector state, term statistics, term-index slices
-/// and roots — can grow past that at scale; the figure matches the
-/// superfile default.
+/// content hash — slow-vector state, term-index slices and roots — can
+/// grow past that at scale; the figure matches the superfile default.
 pub(in crate::supertable) const CONTENT_ADDRESSED_MULTIPART_THRESHOLD_BYTES: u64 =
     100 * 1024 * 1024;
 
@@ -12085,7 +12082,10 @@ mod tests {
     }
 
     use std::{
-        sync::Arc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -12184,6 +12184,65 @@ mod tests {
                     if column == REQUIRED_COLUMN
             ),
             "{err}"
+        );
+    }
+
+    /// A commit that lands while a stamp builds its successor moves the
+    /// pointer past the stamp's snapshot. The stamp reloads and retries
+    /// instead of failing on that first lost race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stamp_retries_when_a_commit_lands_during_its_build() {
+        let directory = TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(directory.path()).expect("provider"));
+        let options = || default_supertable_options().with_storage(Arc::clone(&storage));
+        let table = Supertable::create(options()).expect("create");
+        {
+            let mut writer = table.writer().expect("writer");
+            writer
+                .append(&build_title_batch(&["alpha"]))
+                .expect("append");
+            writer.commit().expect("commit");
+        }
+        // Another process committing to the same table.
+        let other = Supertable::open(options()).expect("open");
+
+        let attempts = AtomicUsize::new(0);
+        stamp_with_retries(table.inner(), &storage, "test", |old| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let other = &other;
+            async move {
+                if attempt == 0 {
+                    let mut writer = other.writer().expect("writer");
+                    writer
+                        .append(&build_title_batch(&["beta"]))
+                        .expect("append");
+                    writer.commit().expect("commit");
+                }
+                let reference = old
+                    .term_index_ref()
+                    .cloned()
+                    .expect("the commits publish a term index");
+                Ok(Some(old.with_term_index(reference)))
+            }
+        })
+        .await
+        .expect("the stamp retries past the concurrent commit");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "one lost race, then a win"
+        );
+        assert_eq!(
+            table
+                .inner()
+                .manifest
+                .load_full()
+                .get_all_superfiles()
+                .len(),
+            2,
+            "the retry built on the other commit"
         );
     }
 
@@ -12330,6 +12389,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Graph(g) => Some(g),
             slow_vector_state::ResidentIndexKind::Flat(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("data graph present after full build");
         assert!(
@@ -12427,6 +12488,8 @@ mod tests {
         .and_then(|kind| match kind {
             slow_vector_state::ResidentIndexKind::Flat(f) => Some(f),
             slow_vector_state::ResidentIndexKind::Graph(_) => None,
+            #[cfg(feature = "graph-index")]
+            slow_vector_state::ResidentIndexKind::Adjacency(_) => None,
         })
         .expect("the envelope must state Flat, and the payload decode as one");
 

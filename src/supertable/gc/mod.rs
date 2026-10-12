@@ -26,7 +26,6 @@ use crate::{
             commit::{MANIFEST_DIR, MANIFEST_PARTS_DIR, POINTER_PATH, manifest_uri},
             list::RoutingRef,
             term_index::{self, STORAGE_PREFIX as TERM_INDEX_STORAGE_PREFIX},
-            term_stats::STORAGE_PREFIX as TERM_STATS_STORAGE_PREFIX,
         },
         slow_vector_state::{self, STORAGE_PREFIX as SLOW_VECTOR_STATE_STORAGE_PREFIX},
         wal::persistence::{SUPERFILES_DIR, WalStore},
@@ -130,7 +129,6 @@ fn list_refs(manifest: &ManifestSnapshot) -> impl Iterator<Item = &str> {
         manifest
             .slow_vector_state_centroid_graph_blob()
             .map(|r| r.uri.as_str()),
-        manifest.term_stats_blob().map(|r| r.uri.as_str()),
         manifest.term_index_ref().map(|r| r.uri.as_str()),
     ]
     .into_iter()
@@ -371,7 +369,6 @@ pub(super) async fn gc_storage_sweep_for_inner(
         MANIFEST_DIR,
         MANIFEST_PARTS_DIR,
         SLOW_VECTOR_STATE_STORAGE_PREFIX,
-        TERM_STATS_STORAGE_PREFIX,
         TERM_INDEX_STORAGE_PREFIX,
         // Tombstone sidecars under `superfiles/` (live set includes the
         // paths for current superfiles; orphans age out past the safety gap).
@@ -618,6 +615,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use tempfile::tempdir;
+    use tracing::Level;
     use uuid::Uuid;
 
     use super::*;
@@ -634,7 +632,7 @@ mod tests {
             },
             slow_vector_state,
         },
-        test_helpers::default_supertable_options,
+        test_helpers::{capture_logs, default_supertable_options},
     };
 
     /// The hidden vector index sweeps through a `PrefixedStorageProvider`, which
@@ -778,7 +776,6 @@ mod tests {
                 slow_vector_state_centroids: None,
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: vec![ManifestPartEntry {
@@ -856,7 +853,6 @@ mod tests {
                 }),
                 slow_vector_state_graphs: None,
                 slow_vector_state_centroid_graph: None,
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),
@@ -926,7 +922,6 @@ mod tests {
                     uri: centroid_graph_uri.clone(),
                     content_hash: centroid_graph_hash,
                 }),
-                term_stats: None,
                 term_index: None,
                 term_index_complete: false,
                 parts: Vec::new(),
@@ -941,21 +936,6 @@ mod tests {
             !live.contains(&orphan),
             "unreferenced blob must still be sweepable"
         );
-    }
-
-    /// Every line a test's subscriber formats, so an assertion can read what the sweep logged.
-    #[derive(Clone, Default)]
-    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CapturedLogs {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().expect("log buffer").extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
     }
 
     /// Runs `hook` on a plain thread the first time the sweep lists `data/` after [`Self::arm`],
@@ -1133,23 +1113,14 @@ mod tests {
     /// A multi-thread runtime, so `block_on` drives the sweep on this thread and the thread-local
     /// subscriber sees its events.
     fn sweep_logging(st: &Supertable) -> (GcReport, String) {
-        let logs = CapturedLogs::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::INFO)
-            .finish();
-        let report = tracing::subscriber::with_default(subscriber, || {
+        capture_logs(Level::INFO, || {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("runtime")
                 .block_on(gc_storage_sweep_for_inner(st.inner(), Duration::ZERO))
                 .expect("sweep")
-        });
-        let text = String::from_utf8_lossy(&logs.0.lock().expect("log buffer")).into_owned();
-        (report, text)
+        })
     }
 
     /// Lines reporting loss, under the stable message operators alert on.

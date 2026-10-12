@@ -75,16 +75,19 @@ use std::{
     time::Duration,
 };
 
-use arrow::compute::{concat_batches, take};
-use arrow_array::{Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, UInt32Array};
+use arrow::compute::interleave;
+use arrow_array::{
+    Array, ArrayRef, Decimal128Array, LargeStringArray, RecordBatch, RecordBatchReader,
+};
 use arrow_schema::{DataType, Field, Schema};
 use parquet::basic::{Compression, ZstdLevel};
 use roaring::RoaringBitmap;
 use tempfile::NamedTempFile;
+use tracing::warn;
 
 pub use crate::superfile::vector::builder::VectorConfig;
 use crate::{
-    config::scratch_root,
+    config::{global, scratch_root},
     superfile::{
         BuildError, FtsError, ReadError, SuperfileReader,
         format::{
@@ -103,7 +106,7 @@ use crate::{
             bm25,
             builder::FtsBuilder,
             reader::{ColumnLengthStats, ColumnMeta, FtsReader},
-            reorder::{ForwardIndex, bisect_order},
+            reorder::{BisectParams, ForwardIndex, bisect_order},
             sorted_merge::SortedInput,
             tokenize::STANDARD_TOKENIZER,
         },
@@ -138,16 +141,120 @@ use crate::{
 /// corpus this small has short gaps already and nothing to regroup.
 const REORDER_MIN_DOCS: usize = 4_096;
 
-/// Terms per document the bisection is given. Bounding the forward
-/// index by documents rather than by postings is what keeps the pass a
-/// fixed size whatever the corpus holds: at four bytes a slot this is
-/// about 64 MiB per million documents, and it does not grow with how
-/// much text a document carries.
+/// Bytes in a mebibyte, for the merge memory budget the config states in MiB.
+const BYTES_PER_MIB: u64 = 1 << 20;
+
+/// Share of a merge's memory budget the bisection's forward index may take.
 ///
-/// The terms kept are the most selective a document has, which is where
-/// the grouping signal is. A document with fewer eligible terms
-/// contributes what it has.
+/// Sized so a few-million-document merge holds all of itself at the width
+/// below. A merge larger than that is reordered in runs the budget does hold,
+/// rather than demanding memory without limit: the old fixed count asked for
+/// four bytes a slot times sixteen times the document count with nothing to
+/// stop it — about 134 GiB at two billion documents.
+const REORDER_FORWARD_INDEX_BUDGET_SHARE: u64 = 10;
+
+/// Slots per document the bisection is given.
+///
+/// A fixed width, because it is the width every measurement of this
+/// reordering has been taken at, and nothing shows a wider one paying for
+/// itself. Letting the budget set it instead makes the width grow as the
+/// merge shrinks -- a hundred thousand documents would take 255 slots where
+/// five million take 16 -- so the smallest and most frequent merges would do
+/// the most work per document, which is backwards.
+///
+/// The budget still bounds the forward index. It bounds how many documents
+/// are reordered together, which is [`ReorderPlan::chunk_docs`], rather than
+/// how much of each one is read.
 const REORDER_TERMS_PER_DOC: usize = 16;
+
+/// Bytes the bisection's forward index may take.
+///
+/// `merge_memory_mb` is what the compaction run was configured with, which is
+/// what a per-deployment override sets; the global configuration is the
+/// fallback for a merge with no run behind it.
+///
+/// A merge large enough to be split at the real budget is far larger than a
+/// test can build, so tests narrow this instead of the corpus.
+fn reorder_budget_bytes(merge_memory_mb: Option<u64>) -> u64 {
+    #[cfg(test)]
+    if let Some(bytes) = tests::reorder_budget_override() {
+        return bytes;
+    }
+    merge_memory_mb
+        .unwrap_or(global().compaction.max_memory_mb)
+        .saturating_mul(BYTES_PER_MIB)
+        / REORDER_FORWARD_INDEX_BUDGET_SHARE
+}
+
+/// How a merge's documents are handed to the bisection.
+struct ReorderPlan {
+    /// Slots per document in the forward index.
+    terms_per_doc: usize,
+    /// Documents reordered together. Fewer than the merge holds means the
+    /// merge is reordered in runs of this many, each independently.
+    chunk_docs: usize,
+}
+
+/// How to reorder this merge, or `None` if there is nothing to group by.
+///
+/// The forward index has to fit the merge's memory budget, and that is a
+/// bound on `documents * width`. Spending it on width makes the width shrink
+/// as the merge grows -- and run out entirely a little past twenty million
+/// documents, which gave up on exactly the merges where reordering pays most,
+/// the long-lived packed bases with the longest posting lists and the most
+/// gaps to shorten.
+///
+/// So the width is fixed and the document count gives way instead: a merge
+/// too large to hold is reordered in runs of as many documents as the budget
+/// does hold. Grouping is then confined to each run, which costs the gaps a
+/// document could have closed against one far away in the merge, and keeps
+/// the ones it closes nearby -- where a posting list's gaps are, and all a
+/// block of postings can express anyway.
+///
+/// What a run costs to read depends on how the merge's inputs are shaped. An
+/// input's rows land in one stretch of the output, so a run skips every input
+/// it does not cover: a merge of many inputs each smaller than a run reads
+/// its postings about once over all the runs. An input larger than a run is
+/// read once per run it spans, so a merge of one large previous output and
+/// many small files -- the shape a packed base is re-merged in -- reads that
+/// output as many times as it spans runs. Ending runs on input boundaries
+/// would avoid that; it is not done here, and the cost has not been measured
+/// on that shape.
+fn reorder_plan(
+    n_docs: usize,
+    eligible_postings: u64,
+    budget_bytes: Option<u64>,
+) -> Option<ReorderPlan> {
+    // Nothing eligible means nothing to group by, whatever the budget allows.
+    let carried = eligible_postings.div_ceil(n_docs.max(1) as u64) as usize;
+    if carried == 0 {
+        return None;
+    }
+
+    let budget_slots = reorder_budget_bytes(budget_bytes) / size_of::<u32>() as u64;
+    let holds = |width: usize| (budget_slots / width as u64).max(1) as usize;
+
+    // The full width, unless reserving slots the documents cannot fill is
+    // what splits the merge. A narrower index reads a long document short,
+    // and the mean is no guide to how long the longest are, so it is worth
+    // that only when it buys something: keeping the whole merge in one run.
+    let narrow = carried.min(REORDER_TERMS_PER_DOC);
+    let terms_per_doc = match holds(REORDER_TERMS_PER_DOC) >= n_docs {
+        true => REORDER_TERMS_PER_DOC,
+        false if holds(narrow) >= n_docs => narrow,
+        false => REORDER_TERMS_PER_DOC,
+    };
+
+    // Runs of an even size rather than full ones and a remainder. A merge a
+    // few documents past what the budget holds would otherwise get a second
+    // run of those few, and a run of 32 or fewer is below the size the
+    // bisection splits at, so it would come back in arrival order.
+    let runs = n_docs.div_ceil(holds(terms_per_doc));
+    Some(ReorderPlan {
+        terms_per_doc,
+        chunk_docs: n_docs.div_ceil(runs.max(1)),
+    })
+}
 
 /// Bits of bucket space the bisection groups terms in. Terms are hashed
 /// into it rather than interned, so the vocabulary costs nothing to
@@ -157,6 +264,12 @@ const REORDER_TERMS_PER_DOC: usize = 16;
 /// else: the order is a heuristic, the map records whatever it
 /// produces, and no posting can be made wrong by it.
 const REORDER_TERM_BUCKET_BITS: u32 = 22;
+
+/// Rows per output batch when a multi-cell merge reorders its scalar rows
+/// by stable id, matching the Parquet reader's default batch size. Chunked
+/// so no one batch has to hold every row's strings: past 2 GiB they no
+/// longer fit one `Utf8` array.
+const REORDER_CHUNK_ROWS: usize = 1024;
 
 /// The output row each of an input's documents becomes, `None` where a
 /// tombstone drops it, and how many survived.
@@ -536,6 +649,14 @@ pub struct BuilderOptions {
     /// footer records their ids from here, so every column of a written
     /// file is identified the same way.
     pub(crate) field_ids_outside_schema: HashMap<String, FieldId>,
+    /// Memory this merge may use, in MiB, taken from the compaction settings
+    /// the run was given rather than from the global configuration. The
+    /// reordering sizes its forward index from a share of it, so a deployment
+    /// that raises the merge budget reorders more documents together.
+    ///
+    /// `None` outside compaction, where there is no run to honour and the
+    /// configured value is the only one there is.
+    pub(crate) merge_memory_mb: Option<u64>,
 }
 
 /// Default per-column data-page size limit for the id column
@@ -568,6 +689,21 @@ fn append_stable_id_sidecar(out: &mut Vec<u8>, batch: &RecordBatch, id_column: &
         out.extend_from_slice(&col.value(i).to_le_bytes());
     }
     true
+}
+
+/// A packed id sidecar for `source`, rebuilt from its Parquet `_id` column.
+/// Reads only that column, so a rewrite that carries the rest stays a carry.
+/// Empty, so no sidecar, if the column is not `Decimal128`.
+fn rebuild_id_sidecar(source: &SuperfileReader) -> Result<Vec<u8>, BuildError> {
+    let docs: Vec<u32> = (0..source.n_docs() as u32).collect();
+    let batch = source
+        .take_by_local_doc_ids(&docs, &[source.id_column()])
+        .map_err(Error::other)?;
+    let mut raw = Vec::new();
+    if !append_stable_id_sidecar(&mut raw, &batch, source.id_column()) {
+        return Ok(Vec::new());
+    }
+    Ok(ids::encode_packed(&raw))
 }
 
 /// Materialize the stable-id sidecar from the accumulated batches: one
@@ -628,7 +764,16 @@ impl BuilderOptions {
             fts_corpus_stats: HashMap::new(),
             schema_id: 1,
             field_ids_outside_schema: HashMap::new(),
+            merge_memory_mb: None,
         }
+    }
+
+    /// Give the merge the memory budget its compaction run was configured
+    /// with (see [`BuilderOptions::merge_memory_mb`]). `None` leaves it on
+    /// the configured value.
+    pub(crate) fn with_merge_memory_mb(mut self, mb: Option<u64>) -> Self {
+        self.merge_memory_mb = mb;
+        self
     }
 
     /// Record the field id of each column the schema does not carry (see
@@ -1663,7 +1808,6 @@ impl SuperfileBuilder {
             n_out_docs,
             PostingMerge::TermByTerm,
             None,
-            None,
             output,
         )?;
         Ok(stats)
@@ -1760,23 +1904,24 @@ impl SuperfileBuilder {
                 crc_ms = tracing::field::Empty,
             )
         };
-
         let read_span = detail_span!("multi_cell_merge.read_inputs").entered();
-        let mut scalar_batches = Vec::with_capacity(inputs.len());
-        let mut stats_collector = Vec::with_capacity(inputs.len());
+        let mut scalar_batches: Vec<Vec<RecordBatch>> = Vec::with_capacity(inputs.len());
 
         for input in inputs {
             let reader = &input.reader;
-            let record_batch = input.batch(&superfile_builder.opts)?;
+
+            // Keep batches grouped by input: rows_of needs the original input order.
+            let batches = input
+                .batches(&superfile_builder.opts)?
+                .collect::<Result<Vec<_>, _>>()?;
+
             let v = reader.vec().ok_or(BuildError::VectorReadError)?;
             if !v.is_multi_cell() {
                 return Err(BuildError::VectorSchemaMismatch(
                     "build_from_multi_cell_sq8_ivf_readers requires multi-cell inputs".into(),
                 ));
             }
-            // Per-input FTS config gate: the carry loop below skips
-            // FTS-less inputs, so check presence + per-column agreement
-            // here where every input passes through.
+
             let remote_cfg = reader
                 .fts()
                 .map(|f| f.fts_columns_config().collect::<Vec<_>>());
@@ -1784,13 +1929,9 @@ impl SuperfileBuilder {
                 .opts
                 .check_fts_carry_compat(remote_cfg.as_deref())?;
 
-            // Compute statistics from the batch already decoded for this input.
-            stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                &record_batch,
-            )?);
-
-            scalar_batches.push(record_batch);
+            scalar_batches.push(batches);
         }
+
         drop(read_span);
 
         let mut packed_cells: Vec<(u32, MergedIvfSubsection)> = Vec::new();
@@ -1887,7 +2028,7 @@ impl SuperfileBuilder {
             // [optmerge] per-phase split: cells taking the cheap byte-splice
             // (I/O + memcpy) vs the full decode/re-cluster/re-encode rebuild, and
             // the wall in each. Gated, off by default.
-            let __merge_timers = crate::config::global().diagnostics.optimize_phase_timers;
+            let __merge_timers = global().diagnostics.optimize_phase_timers;
             let mut __splice_cells = 0usize;
             let mut __rebuild_cells = 0usize;
             let mut __splice_ns: u128 = 0;
@@ -2008,17 +2149,10 @@ impl SuperfileBuilder {
             // replacement), instead of a hard schema error.
             return Ok(SuperfileStats::from_children(&[]));
         }
-
         // Parquet rows must follow the same cell-directory order as the packed
         // IVF subsections. Hidden index files are `_id`-only; user MultiCell
         // files carry the full scalar schema (title, …) and must be reordered
         // by stable id — not replaced with an id-only batch.
-        let scalar_batch = scalar_batch_in_stable_id_order(
-            &scalar_schema,
-            &id_column,
-            &scalar_batches,
-            &all_stable_ids,
-        )?;
         let rows_of = if superfile_builder.fts_builder.is_some() {
             let id_idx = scalar_schema
                 .index_of(&id_column)
@@ -2033,36 +2167,41 @@ impl SuperfileBuilder {
             inputs
                 .iter()
                 .zip(&scalar_batches)
-                .map(|(input, batch)| {
-                    let ids = batch
-                        .column(id_idx)
-                        .as_any()
-                        .downcast_ref::<Decimal128Array>()
-                        .ok_or_else(|| BuildError::MissingIdColumn(id_column.clone()))?;
+                .map(|(input, batches)| {
+                    let mut ids = Vec::new();
+
+                    for batch in batches {
+                        let id_array = batch
+                            .column(id_idx)
+                            .as_any()
+                            .downcast_ref::<Decimal128Array>()
+                            .ok_or_else(|| BuildError::MissingIdColumn(id_column.clone()))?;
+
+                        ids.extend((0..id_array.len()).map(|i| id_array.value(i)));
+                    }
 
                     let n_local = input
                         .reader
                         .fts()
-                        .map_or(ids.len() as u32, |fts| fts.n_docs());
+                        .map_or(input.reader.n_docs() as u32, |fts| fts.n_docs());
 
                     let mut rank = 0usize;
+                    let mut rows = Vec::with_capacity(n_local as usize);
 
-                    let rows = (0..n_local)
-                        .map(|doc| {
-                            if input
-                                .deleted
-                                .as_ref()
-                                .is_some_and(|deleted| deleted.contains(doc))
-                            {
-                                None
-                            } else {
-                                let stable_id = ids.value(rank);
-                                let row = output_row_of_id.remove(&StableId::new(stable_id));
-                                rank += 1;
-                                row
-                            }
-                        })
-                        .collect::<Vec<Option<RowId>>>();
+                    for doc in 0..n_local {
+                        if input
+                            .deleted
+                            .as_ref()
+                            .is_some_and(|deleted| deleted.contains(doc))
+                        {
+                            rows.push(None);
+                        } else {
+                            let stable_id = *ids.get(rank).ok_or(BuildError::BatchReadError)?;
+                            rank += 1;
+
+                            rows.push(output_row_of_id.remove(&StableId::new(stable_id)));
+                        }
+                    }
 
                     Ok::<_, BuildError>(rows)
                 })
@@ -2070,6 +2209,23 @@ impl SuperfileBuilder {
         } else {
             Vec::new()
         };
+
+        // Flatten once, then reorder scalar rows to match the packed-cell order.
+        let scalar_batches: Vec<RecordBatch> = scalar_batches.into_iter().flatten().collect();
+
+        let scalar_batches = scalar_batches_in_stable_id_order(
+            &scalar_schema,
+            &id_column,
+            &scalar_batches,
+            &all_stable_ids,
+        )?;
+
+        // Compute statistics from the actual output batches, excluding superseded rows.
+        let stats_collector = scalar_batches
+            .iter()
+            .map(SuperfileStats::try_compute_from_record_batch)
+            .collect::<Result<Vec<_>, _>>()?;
+
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
 
         let mut stats = Self::fts_and_parquet_merge_half(
@@ -2078,13 +2234,12 @@ impl SuperfileBuilder {
             rows_of,
             all_stable_ids.len() as u32,
             PostingMerge::TermByTerm,
-            Some(scalar_batch),
-            Some(stats_collector),
+            Some((scalar_batches, stats_collector)),
             output,
         )?;
 
         if scalar_schema.fields().len() == 1 {
-            // Hidden id-only index: superseded parent cells must not be
+            // Hidden ID-only index: superseded parent cells must not be
             // double-counted alongside their replacement children.
             stats.n_docs = all_stable_ids.len() as u64;
             stats.id_min = all_stable_ids.iter().copied().min().unwrap_or(0);
@@ -2185,11 +2340,8 @@ impl SuperfileBuilder {
                  not stored, so they cannot be rebuilt here; re-ingest the column's text"
             )));
         }
-        let record_batch = adapted_batch(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
+        let batches = adapted_batches(reader, deleted_docs_bitmap.clone(), adapter, &self.opts)?;
 
-        let superfile_stats = SuperfileStats::try_compute_from_record_batch(&record_batch)?;
-
-        let num_rows = record_batch.num_rows();
         let mut vectors: Vec<Vec<f32>> = Vec::new();
         if let Some(v) = reader.vec() {
             let reader_columns: Vec<_> = v.vector_columns_config().collect();
@@ -2216,10 +2368,10 @@ impl SuperfileBuilder {
                     });
                 }
 
-                let mut this_col_vectors = Vec::with_capacity(builder_col.dim * num_rows);
                 let result = v
                     .get_vectors_for_merge(&reader_col.name)
                     .map_err(|_| BuildError::VectorReadError)?;
+                let mut this_col_vectors = Vec::with_capacity(builder_col.dim * result.len());
                 for (row_idx, single_row) in result.iter().enumerate() {
                     // Skip deleted documents: only include rows not in the deleted_docs_bitmap
                     if let Some(ref bitmap) = deleted_docs_bitmap
@@ -2233,7 +2385,6 @@ impl SuperfileBuilder {
             }
         }
 
-        let slices: Vec<&[f32]> = vectors.iter().map(|row| row.as_slice()).collect();
         // Carry the input's prebuilt postings across (before the append
         // advances `next_local_doc_id`) instead of re-tokenizing its rows:
         // the merge is cheaper, byte-faithful to the input's index, and an
@@ -2244,8 +2395,44 @@ impl SuperfileBuilder {
         }
         // Re-analyze exactly what the carry left behind.
         let index_fts = scope != CarryScope::AllColumns;
-        self.add_batch_inner(&record_batch, &slices, index_fts)?;
-        Ok(superfile_stats)
+        // Every vector column the output needs, even with no rows to add.
+        if vectors.len() != self.opts.vector_columns.len() {
+            return Err(BuildError::VectorCountMismatch {
+                expected: self.opts.vector_columns.len(),
+                actual: vectors.len(),
+            });
+        }
+        // Batch by batch, each with its rows' slice of every vector column.
+        let mut stats = SuperfileStats::from_children(&[]);
+        let mut first_row = 0;
+        for batch in batches {
+            let batch = batch?;
+            let end_row = first_row + batch.num_rows();
+            let slices = vectors
+                .iter()
+                .zip(&self.opts.vector_columns)
+                .map(|(column, config)| {
+                    column
+                        .get(first_row * config.dim..end_row * config.dim)
+                        .ok_or(BuildError::VectorReadError)
+                })
+                .collect::<Result<Vec<&[f32]>, _>>()?;
+            stats.merge(&SuperfileStats::try_compute_from_record_batch(&batch)?);
+            self.add_batch_inner(&batch, &slices, index_fts)?;
+            first_row = end_row;
+        }
+        // Each batch took only its own rows' vectors; any left over belong
+        // to no row.
+        for (column, config) in vectors.iter().zip(&self.opts.vector_columns) {
+            if column.len() != first_row * config.dim {
+                return Err(BuildError::VectorDimMismatch {
+                    column: config.column.clone(),
+                    expected: first_row * config.dim,
+                    actual: column.len(),
+                });
+            }
+        }
+        Ok(stats)
     }
 
     /// A standalone merge: the output averages document length over its
@@ -2345,6 +2532,7 @@ impl SuperfileBuilder {
         n_fts_columns: u32,
         n_out_docs: u32,
         rows_of: &[Vec<Option<RowId>>],
+        merge_memory_mb: Option<u64>,
     ) -> Result<Option<Vec<u32>>, BuildError> {
         if (n_out_docs as usize) <= REORDER_MIN_DOCS {
             return Ok(None);
@@ -2393,82 +2581,161 @@ impl SuperfileBuilder {
             d >= 2 && d <= too_common
         };
 
+        // How many terms the corpus offers per document, summed over the
+        // buckets rather than the postings, so this costs a walk of the degree
+        // table and not a third pass over the index.
+        let eligible_postings: u64 = df
+            .iter()
+            .enumerate()
+            .filter(|&(t, _)| eligible(t as u32))
+            .map(|(_, &d)| u64::from(d))
+            .sum();
+        let Some(plan) = reorder_plan(n_out_docs as usize, eligible_postings, merge_memory_mb)
+        else {
+            // No term groups anything; arrival order it is.
+            return Ok(None);
+        };
+        let terms_per_doc = plan.terms_per_doc;
+
+        // The stretch of output rows each input covers, so a run of documents
+        // reads only the inputs it actually holds and the postings are read
+        // about once over the whole merge however many runs there are.
+        let span_of: Vec<Option<(usize, usize)>> = rows_by_blob
+            .iter()
+            .map(|rows| {
+                let mut lo = usize::MAX;
+                let mut hi = 0usize;
+                for row in rows.iter().flatten() {
+                    let row = row.get() as usize;
+                    lo = lo.min(row);
+                    hi = hi.max(row);
+                }
+                (lo <= hi).then_some((lo, hi))
+            })
+            .collect();
+
         // Pass two: keep each document's most selective terms, in a
         // fixed number of slots per document. `worst` tracks the slot
         // holding the least selective term kept so far, so a posting
         // that cannot displace it costs one comparison.
-        // An ineligible term is skipped before its postings are read, and
-        // `displaced` counts the kept terms that later lost their slot.
+        // An ineligible term is skipped before its postings are read.
         let pick_span = detail_span!("merge_order_pick_terms").entered();
         let n = n_out_docs as usize;
-        let mut slots: Vec<u32> = vec![0; n * REORDER_TERMS_PER_DOC];
-        let mut filled: Vec<u8> = vec![0; n];
-        let mut worst: Vec<u8> = vec![0; n];
-        for ((reader, _), rows) in readers.iter().zip(rows_by_blob.iter()) {
-            let fts = reader.fts().expect("checked above");
-            for column_id in 0..n_fts_columns {
-                let on_term = |term: &[u8]| {
-                    let t = term_bucket(term);
-                    let keep = eligible(t);
-                    keep.then_some(t)
-                };
-                fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
-                    let Some(row) = rows[local_doc as usize] else {
-                        return;
+        let mut order: Vec<u32> = Vec::with_capacity(n);
+        let mut grouped_any = false;
+        let mut first_row = 0usize;
+        while first_row < n {
+            let past_row = first_row.saturating_add(plan.chunk_docs).min(n);
+            let run = past_row - first_row;
+            let mut slots: Vec<u32> = vec![0; run * terms_per_doc];
+            let mut filled: Vec<u8> = vec![0; run];
+            let mut worst: Vec<u8> = vec![0; run];
+            for (((reader, _), rows), span) in
+                readers.iter().zip(rows_by_blob.iter()).zip(span_of.iter())
+            {
+                match *span {
+                    Some((lo, hi)) if lo < past_row && hi >= first_row => {}
+                    _ => continue,
+                }
+                let fts = reader.fts().expect("checked above");
+                for column_id in 0..n_fts_columns {
+                    let on_term = |term: &[u8]| {
+                        let t = term_bucket(term);
+                        let keep = eligible(t);
+                        keep.then_some(t)
                     };
-                    let row = row.get() as usize;
-                    let slot_base = row * REORDER_TERMS_PER_DOC;
-                    let used = filled[row] as usize;
-                    if used < REORDER_TERMS_PER_DOC {
-                        slots[slot_base + used] = t;
-                        if used == 0
-                            || df[t as usize] > df[slots[slot_base + worst[row] as usize] as usize]
-                        {
-                            worst[row] = used as u8;
+                    fts.for_each_term_doc(column_id, on_term, |&t, local_doc| {
+                        let Some(row) = rows[local_doc as usize] else {
+                            return;
+                        };
+                        let row = row.get() as usize;
+                        if row < first_row || row >= past_row {
+                            return;
                         }
-                        filled[row] = (used + 1) as u8;
-                        return;
-                    }
-                    let worst_slot = slot_base + worst[row] as usize;
-                    if df[t as usize] >= df[slots[worst_slot] as usize] {
-                        return;
-                    }
-                    slots[worst_slot] = t;
+                        let row = row - first_row;
+                        let slot_base = row * terms_per_doc;
+                        let used = filled[row] as usize;
+                        if used < terms_per_doc {
+                            slots[slot_base + used] = t;
+                            if used == 0
+                                || df[t as usize]
+                                    > df[slots[slot_base + worst[row] as usize] as usize]
+                            {
+                                worst[row] = used as u8;
+                            }
+                            filled[row] = (used + 1) as u8;
+                            return;
+                        }
+                        let worst_slot = slot_base + worst[row] as usize;
+                        if df[t as usize] >= df[slots[worst_slot] as usize] {
+                            return;
+                        }
+                        slots[worst_slot] = t;
 
-                    // The worst moved; find it again over the fixed,
-                    // small slot count.
-                    let mut w = 0usize;
-                    for i in 1..REORDER_TERMS_PER_DOC {
-                        if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize] {
-                            w = i;
+                        // The worst moved; find it again over the fixed,
+                        // small slot count.
+                        let mut w = 0usize;
+                        for i in 1..terms_per_doc {
+                            if df[slots[slot_base + i] as usize] > df[slots[slot_base + w] as usize]
+                            {
+                                w = i;
+                            }
                         }
-                    }
-                    worst[row] = w as u8;
-                })
-                .map_err(|e| {
-                    BuildError::Io(Error::other(format!(
-                        "fts merge: reading terms for the document order failed: {e}"
-                    )))
-                })?;
+                        worst[row] = w as u8;
+                    })
+                    .map_err(|e| {
+                        BuildError::Io(Error::other(format!(
+                            "fts merge: reading terms for the document order failed: {e}"
+                        )))
+                    })?;
+                }
             }
+
+            let docs: Vec<&[u32]> = (0..run)
+                .map(|row| {
+                    let lo = row * terms_per_doc;
+                    &slots[lo..lo + filled[row] as usize]
+                })
+                .collect();
+            match docs.iter().all(|d| d.is_empty()) {
+                // No term in this run groups anything; it keeps arrival order
+                // while the rest of the merge is still reordered.
+                true => order.extend(first_row as u32..past_row as u32),
+                false => {
+                    grouped_any = true;
+                    let fwd = ForwardIndex::from_docs(&docs);
+                    drop(docs);
+                    let _bisect_span = detail_span!("merge_order_bisect", docs = run).entered();
+                    order.extend(
+                        bisect_order(&fwd, BisectParams::default())
+                            .into_iter()
+                            .map(|d| d + first_row as u32),
+                    );
+                }
+            }
+            first_row = past_row;
         }
         drop(df);
         drop(pick_span);
 
-        let docs: Vec<&[u32]> = (0..n)
-            .map(|row| {
-                let lo = row * REORDER_TERMS_PER_DOC;
-                &slots[lo..lo + filled[row] as usize]
-            })
-            .collect();
-        if docs.iter().all(|d| d.is_empty()) {
-            return Ok(None);
+        // Each run contributes its own rows and nothing else, so the runs
+        // together are still a permutation of the merge. Cheap to state and
+        // the one thing a chunking mistake would break.
+        debug_assert_eq!(order.len(), n, "the reordering lost or gained rows");
+        debug_assert!(
+            {
+                let mut seen = order.clone();
+                seen.sort_unstable();
+                seen.dedup();
+                seen.len() == n
+            },
+            "the reordering named a row twice"
+        );
+
+        match grouped_any {
+            true => Ok(Some(order)),
+            false => Ok(None),
         }
-        let fwd = ForwardIndex::from_docs(&docs);
-        drop(docs);
-        drop(slots);
-        let _bisect_span = detail_span!("merge_order_bisect", docs = n).entered();
-        Ok(Some(bisect_order(&fwd)))
     }
 
     test_visible! {
@@ -2507,7 +2774,6 @@ impl SuperfileBuilder {
             n_out_docs,
             merge,
             None,
-            None,
             output,
         )
     }
@@ -2518,8 +2784,7 @@ impl SuperfileBuilder {
         rows_of: Vec<Vec<Option<RowId>>>,
         n_out_docs: u32,
         merge: PostingMerge,
-        ordered_batch: Option<RecordBatch>,
-        precomputed_stats: Option<Vec<SuperfileStats>>,
+        ordered: Option<(Vec<RecordBatch>, Vec<SuperfileStats>)>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
         // Encode the Parquet body incrementally: each input's surviving rows are
@@ -2539,10 +2804,11 @@ impl SuperfileBuilder {
             )?
         };
 
-        let stats_are_precomputed = precomputed_stats.is_some();
+        let (ordered_batches, mut stats_collector) = match ordered {
+            Some((batches, stats)) => (Some(batches), stats),
+            None => (None, Vec::with_capacity(inputs.len())),
+        };
 
-        let mut stats_collector =
-            precomputed_stats.unwrap_or_else(|| Vec::with_capacity(inputs.len()));
         // Stream the stable-id sidecar from the merged rows as they are written
         // to the body, in the same order — so the compacted superfile resolves
         // `_id` from the sidecar just like a fresh build. `ids_ok` clears on the
@@ -2564,7 +2830,13 @@ impl SuperfileBuilder {
                     .iter()
                     .map(|input| (Arc::clone(&input.reader), input.deleted.clone()))
                     .collect();
-                Self::merge_doc_order(&readers, n_fts_columns, n_out_docs, &rows_of)?
+                Self::merge_doc_order(
+                    &readers,
+                    n_fts_columns,
+                    n_out_docs,
+                    &rows_of,
+                    superfile_builder.opts.merge_memory_mb,
+                )?
             }
             false => None,
         };
@@ -2572,7 +2844,7 @@ impl SuperfileBuilder {
         // id a row is stored under.
         let new_of_row: Option<Vec<u32>> = if superfile_builder.fts_builder.is_none() {
             None
-        } else if ordered_batch.is_some() && order.is_none() {
+        } else if ordered_batches.is_some() {
             Some((0..n_out_docs).collect())
         } else {
             order.as_ref().map(|o| {
@@ -2618,27 +2890,6 @@ impl SuperfileBuilder {
                     .map(|f| f.fts_columns_config().collect::<Vec<_>>())
                     .as_deref(),
             )?;
-            // When an ordered batch is supplied, the caller may already have
-            // decoded the inputs and computed their statistics.
-            let record_batch = if ordered_batch.is_none() || !stats_are_precomputed {
-                let start = std::time::Instant::now();
-                let batch = input.batch(&superfile_builder.opts)?;
-                timings.read_parquet += start.elapsed();
-                Some(batch)
-            } else {
-                None
-            };
-
-            if !stats_are_precomputed {
-                let start = std::time::Instant::now();
-                stats_collector.push(SuperfileStats::try_compute_from_record_batch(
-                    record_batch
-                        .as_ref()
-                        .expect("batch must exist when stats are not precomputed"),
-                )?);
-                timings.stats_compute += start.elapsed();
-            }
-
             let start = std::time::Instant::now();
             // Carry the input's prebuilt postings + doc-lengths across,
             // remapped onto the output this batch is about to append (so
@@ -2706,27 +2957,41 @@ impl SuperfileBuilder {
                 }
             }
             timings.fts += start.elapsed();
+            if ordered_batches.is_none() {
+                // Stream surviving rows batch by batch. Do not decode and retain an
+                // entire input in memory.
+                let mut batches = input.batches(&superfile_builder.opts)?;
+                let mut n_rows = 0u32;
 
-            if ordered_batch.is_none() {
-                // Stream this input's surviving rows straight into the Parquet
-                // body and drop the batch. The FTS index for these rows was
-                // already fed above from the input's prebuilt postings.
-                let record_batch = record_batch.as_ref().ok_or_else(|| {
-                    BuildError::FTSSchemaMismatch(
-                        "input batch missing when streaming Parquet rows".into(),
-                    )
-                })?;
+                loop {
+                    let start = std::time::Instant::now();
+                    let Some(record_batch) = batches.next().transpose()? else {
+                        break;
+                    };
+                    timings.read_parquet += start.elapsed();
 
-                let n_rows = record_batch.num_rows() as u32;
-                let start = std::time::Instant::now();
-                body_encoder.write_batch(record_batch)?;
-                timings.write_parquet += start.elapsed();
+                    let start = std::time::Instant::now();
+                    stats_collector.push(SuperfileStats::try_compute_from_record_batch(
+                        &record_batch,
+                    )?);
+                    timings.stats_compute += start.elapsed();
 
-                if ids_ok
-                    && !append_stable_id_sidecar(&mut id_sidecar_bytes, record_batch, &id_column)
-                {
-                    ids_ok = false;
-                    id_sidecar_bytes = Vec::new();
+                    let start = std::time::Instant::now();
+                    body_encoder.write_batch(&record_batch)?;
+                    timings.write_parquet += start.elapsed();
+
+                    if ids_ok
+                        && !append_stable_id_sidecar(
+                            &mut id_sidecar_bytes,
+                            &record_batch,
+                            &id_column,
+                        )
+                    {
+                        ids_ok = false;
+                        id_sidecar_bytes = Vec::new();
+                    }
+
+                    n_rows += record_batch.num_rows() as u32;
                 }
 
                 superfile_builder.next_local_doc_id += n_rows;
@@ -2759,13 +3024,20 @@ impl SuperfileBuilder {
             fb.set_sorted_inputs(sorted_inputs);
         }
 
-        if let Some(batch) = ordered_batch {
-            let n_rows = batch.num_rows() as u32;
-            body_encoder.write_batch(&batch)?;
-            if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, &batch, &id_column) {
-                ids_ok = false;
-                id_sidecar_bytes = Vec::new();
+        if let Some(batches) = ordered_batches {
+            let mut n_rows = 0u32;
+
+            for batch in &batches {
+                body_encoder.write_batch(batch)?;
+
+                if ids_ok && !append_stable_id_sidecar(&mut id_sidecar_bytes, batch, &id_column) {
+                    ids_ok = false;
+                    id_sidecar_bytes = Vec::new();
+                }
+
+                n_rows += batch.num_rows() as u32;
             }
+
             superfile_builder.next_local_doc_id = n_rows;
         }
 
@@ -2994,11 +3266,21 @@ impl SuperfileBuilder {
         source: &SuperfileReader,
     ) -> Result<(), BuildError> {
         self.carry_fts_from_reader_scoped(source, None, CarryScope::UnstoredOnly)?;
-        let batch = source
-            .get_record_batch(None)
+        // Batch by batch, each indexed from the row it starts at. The body is
+        // carried, not encoded here, so the row count goes back to where it
+        // was for the caller to set.
+        let start = self.next_local_doc_id;
+        let batches = source
+            .record_batches(None)
             .map_err(|_| BuildError::BatchReadError)?;
-        let n_rows = u32::try_from(batch.num_rows()).map_err(|_| BuildError::BatchReadError)?;
-        self.index_fts_batch(&batch, n_rows)
+        for batch in batches {
+            let batch = batch.map_err(|_| BuildError::BatchReadError)?;
+            let n_rows = u32::try_from(batch.num_rows()).map_err(|_| BuildError::BatchReadError)?;
+            self.index_fts_batch(&batch, n_rows)?;
+            self.next_local_doc_id += n_rows;
+        }
+        self.next_local_doc_id = start;
+        Ok(())
     }
 
     /// Record that `n_docs` rows were carried in without this builder
@@ -3061,9 +3343,20 @@ impl SuperfileBuilder {
         // The ids sidecar is derived from rows this build never decoded, so
         // it is carried too — re-packed when the source predates the packed
         // layout, which is the upgrade a rewrite is expected to perform.
+        // Opening the source checked only a packed sidecar's header, so its
+        // blocks are checked here. One with a bad block is rebuilt from the
+        // `_id` column instead, so a rewrite repairs it rather than failing.
         let raw_ids = region(kv::IDS_OFFSET, kv::IDS_LENGTH)?.map(|r| bytes.slice(r));
         let ids_bytes: Vec<u8> = match (&raw_ids, source.id_sidecar_is_packed()) {
-            (Some(ids), true) => ids.to_vec(),
+            (Some(ids), true) => match ids::PackedIds::open(ids, source.n_docs() as usize)
+                .and_then(|packed| packed.check_blocks())
+            {
+                Ok(()) => ids.to_vec(),
+                Err(reason) => {
+                    warn!(%reason, "rebuilding the id sidecar from the `_id` column");
+                    rebuild_id_sidecar(source)?
+                }
+            },
             (Some(ids), false) => ids::encode_packed(ids),
             (None, _) => Vec::new(),
         };
@@ -3262,20 +3555,21 @@ pub(crate) fn stamp_ids_by_position(schema: &Arc<Schema>) -> Arc<Schema> {
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
-/// Rebuild a scalar `RecordBatch` whose rows follow `ordered_ids`.
+/// Rebuild scalar `RecordBatch`es whose rows follow `ordered_ids`.
 ///
 /// - **Id-only schema** (hidden vector-index packs): synthesize the Decimal128
 ///   `_id` column from `ordered_ids` directly.
-/// - **Full scalar schema** (user MultiCell packs): concat the input batches,
-///   look up each stable id's row, and `take` every column into cell order so
-///   Parquet stays aligned with the packed IVF directory (and FTS rebuild sees
-///   the text columns).
-fn scalar_batch_in_stable_id_order(
+/// - **Full scalar schema** (user MultiCell packs): look up each stable id's
+///   row across the input batches and `interleave` every column into cell
+///   order so Parquet stays aligned with the packed IVF directory (and FTS
+///   rebuild sees the text columns). Written in chunks of
+///   [`REORDER_CHUNK_ROWS`] rows, never joined into one batch.
+fn scalar_batches_in_stable_id_order(
     schema: &Arc<Schema>,
     id_column: &str,
     batches: &[RecordBatch],
     ordered_ids: &[i128],
-) -> Result<RecordBatch, BuildError> {
+) -> Result<Vec<RecordBatch>, BuildError> {
     if schema.fields().len() == 1 {
         let id_array = Decimal128Array::from_iter_values(ordered_ids.iter().copied())
             .with_precision_and_scale(38, 0)
@@ -3283,79 +3577,99 @@ fn scalar_batch_in_stable_id_order(
                 batch: format!("id Decimal128(38,0) construct failed: {e}"),
                 builder: schema.to_string(),
             })?;
-        return RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as ArrayRef]).map_err(
-            |e| BuildError::BatchSchemaMismatch {
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(id_array) as ArrayRef])
+            .map_err(|e| BuildError::BatchSchemaMismatch {
                 batch: format!("id-only RecordBatch construct failed: {e}"),
                 builder: schema.to_string(),
-            },
-        );
+            })?;
+        return Ok(vec![batch]);
     }
 
     if batches.is_empty() {
         return Err(BuildError::BatchReadError);
     }
-    let concat = concat_batches(schema, batches).map_err(|e| {
-        BuildError::Io(Error::other(format!(
-            "multi-cell merge: concat scalar batches failed: {e}"
-        )))
-    })?;
-    let id_idx =
-        concat
-            .schema()
-            .index_of(id_column)
-            .map_err(|_| BuildError::BatchSchemaMismatch {
-                batch: format!("missing id column {id_column:?} in concatenated scalars"),
-                builder: schema.to_string(),
-            })?;
-    let id_col = concat
-        .column(id_idx)
-        .as_any()
-        .downcast_ref::<Decimal128Array>()
-        .ok_or_else(|| BuildError::BatchSchemaMismatch {
-            batch: format!("id column {id_column:?} is not Decimal128"),
+    let id_idx = schema
+        .index_of(id_column)
+        .map_err(|_| BuildError::BatchSchemaMismatch {
+            batch: format!("missing id column {id_column:?} in scalar batches"),
             builder: schema.to_string(),
         })?;
 
-    let mut id_to_row: HashMap<i128, u32> = HashMap::with_capacity(id_col.len());
-    for row in 0..id_col.len() {
-        let stable_id = id_col.value(row);
-        if id_to_row.insert(stable_id, row as u32).is_some() {
-            return Err(BuildError::VectorSchemaMismatch(format!(
-                "multi-cell merge: duplicate stable_id {stable_id} in scalar batches"
-            )));
+    // Each stable id's `(batch, row)`. A superfile's row count fits `u32`,
+    // so both do.
+    let mut row_of: HashMap<i128, (u32, u32)> = HashMap::with_capacity(ordered_ids.len());
+    for (b, batch) in batches.iter().enumerate() {
+        let id_col = batch
+            .column(id_idx)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .ok_or_else(|| BuildError::BatchSchemaMismatch {
+                batch: format!("id column {id_column:?} is not Decimal128"),
+                builder: schema.to_string(),
+            })?;
+        for row in 0..id_col.len() {
+            let stable_id = id_col.value(row);
+            if row_of.insert(stable_id, (b as u32, row as u32)).is_some() {
+                return Err(BuildError::VectorSchemaMismatch(format!(
+                    "multi-cell merge: duplicate stable_id {stable_id} in scalar batches"
+                )));
+            }
         }
     }
-    if ordered_ids.len() != id_to_row.len() {
+    if ordered_ids.len() != row_of.len() {
         return Err(BuildError::VectorSchemaMismatch(format!(
             "multi-cell merge: {} ordered ids for {} visible scalar rows",
             ordered_ids.len(),
-            id_to_row.len()
+            row_of.len()
         )));
     }
 
-    let mut indices = Vec::with_capacity(ordered_ids.len());
-    for &stable_id in ordered_ids {
-        let row = id_to_row.get(&stable_id).copied().ok_or_else(|| {
-            BuildError::VectorSchemaMismatch(format!(
-                "multi-cell merge: stable_id {stable_id} missing from scalar batches"
-            ))
+    let mut out = Vec::with_capacity(ordered_ids.len().div_ceil(REORDER_CHUNK_ROWS));
+    // `interleave` checks every array it is given on each call, so each
+    // chunk passes only the batches it reads. `slot_of[b]` is batch `b`'s
+    // place in this chunk's list, `None` when the chunk does not read it.
+    let mut slot_of: Vec<Option<usize>> = vec![None; batches.len()];
+    for chunk in ordered_ids.chunks(REORDER_CHUNK_ROWS) {
+        let mut used: Vec<usize> = Vec::new();
+        let mut indices = Vec::with_capacity(chunk.len());
+        for stable_id in chunk {
+            let (b, row) = row_of.get(stable_id).copied().ok_or_else(|| {
+                BuildError::VectorSchemaMismatch(format!(
+                    "multi-cell merge: stable_id {stable_id} missing from scalar batches"
+                ))
+            })?;
+            let (b, row) = (b as usize, row as usize);
+            let slot = *slot_of[b].get_or_insert_with(|| {
+                used.push(b);
+                used.len() - 1
+            });
+            indices.push((slot, row));
+        }
+        for &b in &used {
+            slot_of[b] = None;
+        }
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for c in 0..schema.fields().len() {
+            let arrays: Vec<&dyn Array> = used
+                .iter()
+                .map(|&b| batches[b].column(c).as_ref())
+                .collect();
+            let column = interleave(&arrays, &indices).map_err(|e| {
+                BuildError::Io(Error::other(format!(
+                    "multi-cell merge: interleave scalar column failed: {e}"
+                )))
+            })?;
+            columns.push(column);
+        }
+        let batch = RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+            BuildError::BatchSchemaMismatch {
+                batch: format!("reordered scalar RecordBatch construct failed: {e}"),
+                builder: schema.to_string(),
+            }
         })?;
-        indices.push(row);
+        out.push(batch);
     }
-    let index_array = UInt32Array::from(indices);
-    let mut columns: Vec<ArrayRef> = Vec::with_capacity(concat.num_columns());
-    for col in concat.columns() {
-        let taken = take(col.as_ref(), &index_array, None).map_err(|e| {
-            BuildError::Io(Error::other(format!(
-                "multi-cell merge: take scalar column failed: {e}"
-            )))
-        })?;
-        columns.push(taken);
-    }
-    RecordBatch::try_new(schema.clone(), columns).map_err(|e| BuildError::BatchSchemaMismatch {
-        batch: format!("reordered scalar RecordBatch construct failed: {e}"),
-        builder: schema.to_string(),
-    })
+    Ok(out)
 }
 
 /// Finalize the FTS + vector blobs to two scratch temp files. At corpus scale
@@ -3573,9 +3887,14 @@ impl MergeInput {
         }
     }
 
-    /// The input's surviving rows in the output's scalar shape.
-    pub(crate) fn batch(&self, opts: &BuilderOptions) -> Result<RecordBatch, BuildError> {
-        adapted_batch(
+    /// The input's surviving rows in the output's scalar shape, one
+    /// decoded batch at a time. Never joined into one batch: a string
+    /// column can decode past what one `Utf8` array's offsets can hold.
+    pub(crate) fn batches(
+        &self,
+        opts: &BuilderOptions,
+    ) -> Result<impl Iterator<Item = Result<RecordBatch, BuildError>> + use<'_>, BuildError> {
+        adapted_batches(
             &self.reader,
             self.deleted.clone(),
             self.adapter.as_ref(),
@@ -3595,27 +3914,49 @@ pub fn same_shape_inputs(
         .collect()
 }
 
-/// `reader`'s rows (minus `deleted`) reshaped to `opts.schema`: as read
-/// when the file already has that shape, else through `adapter`, which
-/// null-fills a column the file predates, casts one it holds in another
-/// type, and finds a renamed one by id. The id column is the table's
-/// identity and is matched by name: a file whose id column is named
-/// otherwise belongs to another table.
-fn adapted_batch(
+/// `reader`'s rows (minus `deleted`) reshaped to `opts.schema` by
+/// [`adapt_batch`], one decoded batch at a time. Never joined into one
+/// batch: a string column can decode past what one `Utf8` array's offsets
+/// can hold.
+fn adapted_batches<'a>(
     reader: &SuperfileReader,
     deleted: Option<Arc<RoaringBitmap>>,
-    adapter: Option<&FileSchemaMap>,
+    adapter: Option<&'a FileSchemaMap>,
     opts: &BuilderOptions,
-) -> Result<RecordBatch, BuildError> {
+) -> Result<impl Iterator<Item = Result<RecordBatch, BuildError>> + use<'a>, BuildError> {
+    check_id_column(reader, opts)?;
+    let schema = Arc::clone(&opts.schema);
+    let batches = reader
+        .record_batches(deleted)
+        .map_err(|_| BuildError::BatchReadError)?;
+    // Check the file's shape even when no row survives to be read.
+    adapt_batch(RecordBatch::new_empty(batches.schema()), adapter, &schema)?;
+    Ok(batches.map(move |batch| {
+        let batch = batch.map_err(|_| BuildError::BatchReadError)?;
+        adapt_batch(batch, adapter, &schema)
+    }))
+}
+
+/// The id column is the table's identity and is matched by name: a file
+/// whose id column is named otherwise belongs to another table.
+fn check_id_column(reader: &SuperfileReader, opts: &BuilderOptions) -> Result<(), BuildError> {
     if reader.id_column() != opts.id_column {
         return Err(BuildError::IdColumnMismatch(
             opts.id_column.clone(),
             reader.id_column().to_string(),
         ));
     }
-    let batch = reader
-        .get_record_batch(deleted)
-        .map_err(|_| BuildError::BatchReadError)?;
+    Ok(())
+}
+
+/// `batch` reshaped to `schema`: as read when it already has that shape,
+/// else through `adapter`, which null-fills a column the file predates,
+/// casts one it holds in another type, and finds a renamed one by id.
+fn adapt_batch(
+    batch: RecordBatch,
+    adapter: Option<&FileSchemaMap>,
+    schema: &Arc<Schema>,
+) -> Result<RecordBatch, BuildError> {
     // The adapter decides by id. A name the file shares with the table can
     // belong to a column that was dropped and added again under a new id,
     // whose old values must not ride through under the new column, so the
@@ -3624,24 +3965,24 @@ fn adapted_batch(
         && !map.is_identity()
     {
         return map
-            .adapt(&batch, &opts.schema)
+            .adapt(&batch, schema)
             .map_err(|e| BuildError::SchemaMismatch {
-                mine: opts.schema.to_string(),
+                mine: schema.to_string(),
                 other: format!("{} ({e})", batch.schema()),
             });
     }
-    if same_shape(&batch.schema(), &opts.schema) {
+    if same_shape(&batch.schema(), schema) {
         return Ok(batch);
     }
     match adapter {
         Some(map) => map
-            .adapt(&batch, &opts.schema)
+            .adapt(&batch, schema)
             .map_err(|e| BuildError::SchemaMismatch {
-                mine: opts.schema.to_string(),
+                mine: schema.to_string(),
                 other: format!("{} ({e})", batch.schema()),
             }),
         None => Err(BuildError::SchemaMismatch {
-            mine: opts.schema.to_string(),
+            mine: schema.to_string(),
             other: batch.schema().to_string(),
         }),
     }
@@ -3802,9 +4143,36 @@ fn escape_json(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, io::empty, iter::once, slice, sync::Arc};
+    use std::{cell::Cell, collections::HashMap, io::empty, iter::once, slice, sync::Arc};
 
-    use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, UInt64Array};
+    thread_local! {
+        /// Set by [`with_reorder_budget`] for the thread running a merge.
+        static REORDER_BUDGET: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    /// The narrowed forward-index budget, if this thread is inside
+    /// [`with_reorder_budget`].
+    pub(super) fn reorder_budget_override() -> Option<u64> {
+        REORDER_BUDGET.with(Cell::get)
+    }
+
+    /// Run `f` with the forward index held to `bytes`, so a merge a test can
+    /// afford to build still reaches the chunked path.
+    fn with_reorder_budget<T>(bytes: u64, f: impl FnOnce() -> T) -> T {
+        /// Clears the override however `f` leaves, so one test cannot narrow
+        /// the budget for the next on the same thread.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                REORDER_BUDGET.with(|b| b.set(None));
+            }
+        }
+        REORDER_BUDGET.with(|b| b.set(Some(bytes)));
+        let _clear = Clear;
+        f()
+    }
+
+    use arrow_array::{Decimal128Array, Int64Array, LargeStringArray, StringArray, UInt64Array};
     use arrow_schema::Field;
     use bytes::Bytes;
     use rayon::ThreadPoolBuilder;
@@ -3819,7 +4187,11 @@ mod tests {
                 builder::RADIX_SORT_MIN_TRIPLES, reader::BoolMode, short::SHORT_MAX_DF,
                 sorted_merge::TERMS_PER_CHUNK,
             },
-            vector::rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            vector::{
+                builder::build_merged_subsection_from_materialized,
+                cell_posting::EncodedCellRow,
+                rerank_codec::{RerankCodec, SQ8_FIXED_OFFSET, SQ8_FIXED_SCALE},
+            },
         },
         test_helpers::{decimal128_ids, default_vector_config},
         utils::terms::DictEntry,
@@ -4009,6 +4381,80 @@ mod tests {
             vec![Arc::new(ids), Arc::new(title), Arc::new(body)],
         )
         .expect("build RecordBatch")
+    }
+
+    /// An input of another shape is refused even when every one of its
+    /// rows is deleted, so no batch is ever read.
+    #[test]
+    fn add_batch_from_reader_refuses_other_shape_with_no_rows_left() {
+        let title_only = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let mut input = SuperfileBuilder::new(BuilderOptions::new(
+            title_only.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        ))
+        .expect("new SuperfileBuilder");
+        let batch = RecordBatch::try_new(
+            title_only,
+            vec![
+                Arc::new(decimal128_ids(vec![10u64, 11])),
+                Arc::new(LargeStringArray::from(vec!["hello world", "rust async"])),
+            ],
+        )
+        .expect("build RecordBatch");
+        input.add_batch(&batch, &[]).expect("add_batch");
+        let input = SuperfileReader::open(Bytes::from(input.finish().expect("finish input")))
+            .expect("open input");
+
+        // The output also has a `body` column, and no adapter maps it.
+        let mut b = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let every_row: RoaringBitmap = (0..2).collect();
+        let err = b
+            .add_batch_from_reader(&input, Some(Arc::new(every_row)))
+            .expect_err("another shape");
+        assert!(
+            matches!(err, BuildError::SchemaMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    /// An input without the vector index the output needs is refused even
+    /// when every one of its rows is deleted, so no batch is ever added.
+    #[test]
+    fn add_batch_from_reader_refuses_missing_vectors_with_no_rows_left() {
+        let mut input = SuperfileBuilder::new(opts_minimal()).expect("new SuperfileBuilder");
+        let schema = input.opts.schema.clone();
+        input
+            .add_batch(&batch_two_rows(&schema), &[])
+            .expect("add_batch");
+        let input = SuperfileReader::open(Bytes::from(input.finish().expect("finish input")))
+            .expect("open input");
+
+        let with_vectors = BuilderOptions::new(
+            schema,
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![default_vector_config("emb", 7)],
+        );
+        let mut b = SuperfileBuilder::new(with_vectors).expect("new SuperfileBuilder");
+        let every_row: RoaringBitmap = (0..2).collect();
+        let err = b
+            .add_batch_from_reader(&input, Some(Arc::new(every_row)))
+            .expect_err("no vector index to carry");
+        assert!(
+            matches!(
+                err,
+                BuildError::VectorCountMismatch {
+                    expected: 1,
+                    actual: 0
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -4667,39 +5113,7 @@ mod tests {
         cells: &[(u32, usize, usize)],
         unstored: bool,
     ) -> Arc<SuperfileReader> {
-        use crate::superfile::vector::{
-            builder::build_merged_subsection_from_materialized,
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
-        };
-
         const DIM: usize = 16;
-        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
-            let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
-                (Arc::from(vec![1.0f32; DIM]), Arc::from(vec![0.0f32; DIM]));
-            (0..n)
-                .map(|i| {
-                    let local = i as u32;
-                    let stable_id = id_base + (cell as i128) * 100 + local as i128;
-                    let mut codes = vec![0u8; DIM];
-                    codes[0] = (cell as u8).wrapping_add(i as u8);
-                    MaterializedIvfRow {
-                        local_doc_id: local,
-                        stable_id,
-                        cluster: 0,
-                        rabitq_code: vec![0u8; DIM.div_ceil(8)],
-                        encoded: EncodedCellRow {
-                            stable_id,
-                            rerank_codec: RerankCodec::Sq8Residual,
-                            scale: Arc::clone(&scale),
-                            offset: Arc::clone(&offset),
-                            codes,
-                            residuals: vec![0u8; DIM],
-                            norm_sq: Some(1.0),
-                        },
-                    }
-                })
-                .collect()
-        };
         let vec_cfg = VectorConfig {
             column: "emb".into(),
             dim: DIM,
@@ -4711,7 +5125,7 @@ mod tests {
         let mut ids: Vec<i128> = Vec::new();
         let mut packed = Vec::with_capacity(cells.len());
         for &(cell_id, n_rows, n_cent) in cells {
-            let rows = make_rows(cell_id, n_rows);
+            let rows = sq8_cell_rows(id_base, cell_id, n_rows, RerankCodec::Sq8Residual, DIM);
             ids.extend(rows.iter().map(|r| r.stable_id));
             let sub = build_merged_subsection_from_materialized(vec_cfg.clone(), n_cent, rows)
                 .expect("cell subsection");
@@ -5756,6 +6170,94 @@ mod tests {
         }
     }
 
+    /// The width is fixed and the budget decides how many documents are
+    /// reordered together, so a merge stays reorderable however large it
+    /// grows and a small one does no more work per document than a large one.
+    #[test]
+    fn a_merge_too_large_to_hold_is_reordered_in_runs() {
+        let rich = 200;
+        let plan = |docs: usize| {
+            reorder_plan(docs, docs as u64 * rich, None)
+                .unwrap_or_else(|| panic!("{docs} documents still reorder"))
+        };
+        let budget = reorder_budget_bytes(None);
+
+        // Everything a production merge is actually made of reorders whole, at
+        // the one width this has ever been measured at. A merge a twentieth
+        // the size of another reads just as much of each document.
+        for docs in [89_034usize, 185_000, 355_000, 2_170_000, 5_000_000] {
+            let p = plan(docs);
+            assert_eq!(
+                (p.terms_per_doc, p.chunk_docs),
+                (REORDER_TERMS_PER_DOC, docs),
+                "{docs} documents should reorder whole at the fixed width"
+            );
+        }
+
+        // Past what the budget holds, the width stays and the runs get
+        // shorter, where this used to narrow the width until it gave up on
+        // reordering altogether.
+        for docs in [25_160_520usize, 100_000_000, 2_000_000_000] {
+            let p = plan(docs);
+            assert_eq!(
+                p.terms_per_doc, REORDER_TERMS_PER_DOC,
+                "{docs}: a chunked merge keeps the width"
+            );
+            assert!(p.chunk_docs < docs, "{docs}: expected runs");
+            let wants = p.chunk_docs as u64 * p.terms_per_doc as u64 * size_of::<u32>() as u64;
+            assert!(wants <= budget, "{docs}: a run wants {wants} of {budget}");
+        }
+
+        // Narrowing is worth it only when it is what keeps the merge whole.
+        // Thirty million documents carrying two eligible terms fit in one run
+        // at that width and would not at sixteen.
+        let poor =
+            reorder_plan(30_000_000, 30_000_000 * 2, None).expect("two terms apiece still group");
+        assert_eq!((poor.terms_per_doc, poor.chunk_docs), (2, 30_000_000));
+
+        // A merge that gets split either way keeps the full width rather than
+        // reading its long documents short for nothing.
+        let wide = reorder_plan(400_000_000, 400_000_000 * 2, None).expect("still reorders");
+        assert_eq!(wide.terms_per_doc, REORDER_TERMS_PER_DOC);
+
+        // A merge that fits at the full width is never narrowed.
+        let fits = reorder_plan(1_000_000, 1_000_000 * 2, None).expect("still reorders");
+        assert_eq!(
+            (fits.terms_per_doc, fits.chunk_docs),
+            (REORDER_TERMS_PER_DOC, 1_000_000)
+        );
+
+        // Runs divide evenly, so a merge a hair past what the budget holds
+        // does not get a second run of a handful of documents -- a run of 32
+        // or fewer is below the size the bisection splits at.
+        let holds = (reorder_budget_bytes(None)
+            / size_of::<u32>() as u64
+            / REORDER_TERMS_PER_DOC as u64) as usize;
+        let over = plan(holds + 10);
+        assert_eq!(
+            over.chunk_docs,
+            (holds + 10).div_ceil(2),
+            "runs should halve"
+        );
+        let last = (holds + 10) - over.chunk_docs;
+        assert!(
+            over.chunk_docs - last <= 1,
+            "the runs should come out even, got {} and {last}",
+            over.chunk_docs
+        );
+
+        // The budget comes from the run's own settings, not the global ones.
+        let roomy = reorder_plan(20_000_000, 20_000_000 * 200, Some(32_768))
+            .expect("a larger budget still reorders");
+        assert_eq!(
+            roomy.chunk_docs, 20_000_000,
+            "a run given more memory holds more documents"
+        );
+
+        // Nothing eligible is the one case with nothing to group by.
+        assert!(reorder_plan(1_000, 0, None).is_none());
+    }
+
     /// One document of the reordering corpus: drawn from a few
     /// vocabularies and interleaved, so no input is a single topic and
     /// arrival order groups nothing. The pair "t0 t1" recurs, giving a
@@ -5773,6 +6275,140 @@ mod tests {
         }
         t.push_str("common");
         t
+    }
+
+    /// The run's budget survives the reshaping a merge does to its options,
+    /// so the width and run length the plan picks are the ones the caller's
+    /// settings asked for rather than the configured default.
+    #[test]
+    fn a_merge_keeps_the_budget_its_run_was_given() {
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        );
+        assert_eq!(opts.merge_memory_mb, None, "no run behind a plain build");
+
+        let given = opts.clone().with_merge_memory_mb(Some(16_384));
+        assert_eq!(given.merge_memory_mb, Some(16_384));
+
+        // The merge rebuilds its options from the inputs before it runs, and
+        // that reshaping must not drop the budget on the way.
+        let bytes = reorder_corpus_input(&given, &given.schema.clone(), 0, 64);
+        let reader = SuperfileReader::open(Bytes::from(bytes)).expect("open");
+        let inputs = vec![MergeInput {
+            reader: Arc::new(reader),
+            deleted: None,
+            adapter: None,
+        }];
+        let reshaped = merge_builder_opts(&inputs, given).expect("merge options");
+        assert_eq!(
+            reshaped.merge_memory_mb,
+            Some(16_384),
+            "the budget must reach the builder the merge actually runs with"
+        );
+    }
+
+    /// A merge too large to hold at a usable width is reordered in runs, and
+    /// the runs together still name every row exactly once and answer every
+    /// query the same.
+    ///
+    /// The budget is narrowed rather than the merge enlarged: at the real one
+    /// this path needs more than twenty million documents.
+    #[tokio::test]
+    async fn a_chunked_merge_keeps_every_row_and_every_answer() {
+        const PER_INPUT: u64 = 2_600;
+        /// Too small to hold this merge at any usable width, whatever its
+        /// documents carry, so the merge has to be reordered in runs.
+        const BUDGET_BYTES: u64 = 16 * 1024;
+
+        let opts = BuilderOptions::new(
+            schema_with_fts(),
+            "doc_id",
+            vec![FtsConfig::new("title").positions(true)],
+            vec![],
+        );
+        let schema = opts.schema.clone();
+        let n = (PER_INPUT * 2) as usize;
+        let r1 = SuperfileReader::open(Bytes::from(reorder_corpus_input(
+            &opts, &schema, 0, PER_INPUT,
+        )))
+        .expect("open 1");
+        let r2 = SuperfileReader::open(Bytes::from(reorder_corpus_input(
+            &opts,
+            &schema,
+            PER_INPUT,
+            PER_INPUT * 2,
+        )))
+        .expect("open 2");
+        let inputs = vec![
+            (Arc::new(r1), tombstones(&[])),
+            (Arc::new(r2), tombstones(&[])),
+        ];
+
+        let (reindex_bytes, _) =
+            SuperfileBuilder::build_from_readers(&inputs).expect("re-index build");
+        let (merge_bytes, _) = with_reorder_budget(BUDGET_BYTES, || {
+            // Term-poor and term-rich alike, this budget leaves no room to
+            // hold the merge whole, so it is reordered in runs of its rows
+            // rather than left in arrival order.
+            for carried in [2u64, 100] {
+                let plan =
+                    reorder_plan(n, n as u64 * carried, None).expect("the merge still reorders");
+                assert!(
+                    plan.chunk_docs < n,
+                    "carrying {carried}: expected runs, got all {n} rows at once"
+                );
+            }
+            SuperfileBuilder::build_from_readers_fts_merge(&inputs).expect("k-way fts merge")
+        });
+
+        let reindex_reader =
+            SuperfileReader::open(Bytes::from(reindex_bytes)).expect("open re-index");
+        let merge_reader = SuperfileReader::open(Bytes::from(merge_bytes)).expect("open merge");
+        let merge_fts = merge_reader.fts().expect("merged fts");
+        let reindex_fts = reindex_reader.fts().expect("re-index fts");
+        assert!(
+            merge_fts.has_doc_map(),
+            "a chunked merge still chooses its own order"
+        );
+
+        // Every row is still there, in its arrival position.
+        assert_eq!(
+            reindex_reader
+                .get_record_batch(None)
+                .expect("re-index rows"),
+            merge_reader.get_record_batch(None).expect("merged rows"),
+            "reordering in runs must not move a Parquet row"
+        );
+
+        // And the postings, which the runs wrote in a different order from
+        // every input and from the re-indexed file, still answer the same.
+        let all_k = n + 1;
+        for terms in [
+            &["t0"][..],
+            &["t41"][..],
+            &["common"][..],
+            &["t0", "t41"][..],
+            &["t5", "t45", "t85"][..],
+        ] {
+            let mut want = reindex_fts
+                .search("title", terms, all_k, BoolMode::Or)
+                .await
+                .expect("re-index search");
+            let mut got = merge_fts
+                .search("title", terms, all_k, BoolMode::Or)
+                .await
+                .expect("merged search");
+            assert_eq!(want.len(), got.len(), "{terms:?}: match count");
+            want.sort_by_key(|&(d, _)| d);
+            got.sort_by_key(|&(d, _)| d);
+            for ((dw, sw), (dg, sg)) in want.iter().zip(got.iter()) {
+                assert_eq!(dw, dg, "{terms:?}: row {dw} missing or extra");
+                assert!((sw - sg).abs() < 1e-5, "{terms:?} row {dw}: {sw} vs {sg}");
+            }
+        }
     }
 
     /// One superfile of that corpus, ids `lo..hi`.
@@ -6226,6 +6862,276 @@ mod tests {
             ],
             vec![],
         )
+    }
+
+    /// Size of one `payload` value in the large-string merge test.
+    const LARGE_VALUE_BYTES: usize = 1 << 20;
+    /// Rows in that test's input: just over 2 GiB of `payload`, past what
+    /// one `Utf8` array's 32-bit offsets can address.
+    const LARGE_INPUT_ROWS: usize = 2_100;
+    /// Rows handed to the builder per `add_batch`, to keep the build small.
+    const LARGE_ADD_ROWS: usize = 64;
+
+    /// `(doc_id, title, payload)`: a small FTS `title` beside a `Utf8`
+    /// `payload` too large for one array once the whole input is read.
+    fn large_payload_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("payload", DataType::Utf8, false),
+        ]))
+    }
+
+    /// A superfile of [`LARGE_INPUT_ROWS`] rows under `opts`, ids from 0,
+    /// each `payload` [`LARGE_VALUE_BYTES`] of one repeated byte, so the
+    /// file is small on disk but decodes past 2 GiB. `packed` cells, when
+    /// given, replace the vector index the rows would build.
+    fn large_payload_input(
+        opts: BuilderOptions,
+        packed: Option<Vec<(u32, MergedIvfSubsection)>>,
+    ) -> Arc<SuperfileReader> {
+        const _: () = assert!(LARGE_VALUE_BYTES * LARGE_INPUT_ROWS > i32::MAX as usize);
+        let schema = opts.schema.clone();
+        let dim = opts.vector_columns.first().map(|c| c.dim);
+        let value = "a".repeat(LARGE_VALUE_BYTES);
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        for start in (0..LARGE_INPUT_ROWS).step_by(LARGE_ADD_ROWS) {
+            let n = LARGE_ADD_ROWS.min(LARGE_INPUT_ROWS - start);
+            let batch = RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(decimal128_ids((start..start + n).map(|i| i as u64))),
+                    Arc::new(LargeStringArray::from(vec!["word"; n])),
+                    Arc::new(StringArray::from(vec![value.as_str(); n])),
+                ],
+            )
+            .expect("build RecordBatch");
+            match dim {
+                // One-hot vectors, so the IVF trains on distinct points.
+                Some(dim) => {
+                    let mut flat = vec![0.0f32; n * dim];
+                    for i in 0..n {
+                        flat[i * dim + (start + i) % dim] = 1.0;
+                    }
+                    b.add_batch(&batch, &[flat.as_slice()])
+                }
+                None => b.add_batch(&batch, &[]),
+            }
+            .expect("add_batch");
+        }
+        if let Some(packed) = packed {
+            b.set_prebuilt_multi_cell_ivfs(packed).expect("pack");
+        }
+        let bytes = b.finish().expect("finish input");
+        Arc::new(SuperfileReader::open(Bytes::from(bytes)).expect("open input"))
+    }
+
+    /// The merge kept every row of a [`large_payload_input`], and every
+    /// `payload` byte. Read batch by batch: the whole column does not fit
+    /// one array.
+    fn assert_large_payload_merged(merged: Vec<u8>, stats: SuperfileStats) {
+        assert_eq!(stats.n_docs, LARGE_INPUT_ROWS as u64);
+        let merged = SuperfileReader::open(Bytes::from(merged)).expect("open merged");
+        let (mut rows, mut payload_bytes) = (0, 0);
+        for batch in merged.record_batches(None).expect("read merged") {
+            let batch = batch.expect("merged batch");
+            let payload = batch
+                .column_by_name("payload")
+                .expect("payload column")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("payload is Utf8");
+            rows += batch.num_rows();
+            payload_bytes += payload.iter().map(|v| v.map_or(0, str::len)).sum::<usize>();
+        }
+        assert_eq!(rows, LARGE_INPUT_ROWS, "every input row survives the merge");
+        assert_eq!(payload_bytes, LARGE_INPUT_ROWS * LARGE_VALUE_BYTES);
+    }
+
+    /// A merge input whose `Utf8` column decodes to more than 2 GiB must
+    /// still merge: no step may join the input's column into one array.
+    #[test]
+    #[ignore = "allocates over 4 GiB; run with --release --ignored"]
+    fn fts_merge_reads_input_with_string_column_over_2_gib() {
+        let opts = BuilderOptions::new(
+            large_payload_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let input = large_payload_input(opts, None);
+        let (merged, stats) = SuperfileBuilder::build_from_readers_fts_merge(&[(input, None)])
+            .expect("merge an input whose string column passes 2 GiB");
+        assert_large_payload_merged(merged, stats);
+    }
+
+    /// The sq8 IVF merge over the same input.
+    #[test]
+    #[ignore = "allocates over 4 GiB; run with --release --ignored"]
+    fn sq8_merge_reads_input_with_string_column_over_2_gib() {
+        let opts = BuilderOptions::new(
+            large_payload_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![default_vector_config("emb", 7).with_rerank_codec(RerankCodec::Sq8Residual)],
+        );
+        let input = large_payload_input(opts, None);
+        let (merged, stats) = SuperfileBuilder::build_from_sq8_ivf_readers(&[(input, None)])
+            .expect("merge an input whose string column passes 2 GiB");
+        assert_large_payload_merged(merged, stats);
+    }
+
+    /// The multi-cell merge over the same input, which also reorders the
+    /// rows by stable id across batches.
+    #[test]
+    #[ignore = "allocates over 4 GiB; run with --release --ignored"]
+    fn multi_cell_merge_reads_input_with_string_column_over_2_gib() {
+        const DIM: usize = 16;
+        /// Fine clusters in the one packed cell.
+        const N_CENT: usize = 2;
+        let vec_cfg = VectorConfig {
+            column: "emb".into(),
+            dim: DIM,
+            rot_seed: 1,
+            metric: Metric::L2Sq,
+            rerank_codec: RerankCodec::Sq8Residual,
+            provided_centroids: None,
+        };
+        // One cell holding every row, stable ids 0.. to match the scalar ids.
+        let rows = sq8_cell_rows(0, 0, LARGE_INPUT_ROWS, RerankCodec::Sq8Residual, DIM);
+        let cell = build_merged_subsection_from_materialized(vec_cfg.clone(), N_CENT, rows)
+            .expect("cell subsection");
+        let opts = BuilderOptions::new(
+            large_payload_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![vec_cfg],
+        )
+        .with_vector_layout(VectorLayout::MultiCellIvf);
+        let input = large_payload_input(opts, Some(vec![(0, cell)]));
+        let (merged, stats) =
+            SuperfileBuilder::build_from_multi_cell_sq8_ivf_readers(&[(input, None)], &[])
+                .expect("merge an input whose string column passes 2 GiB");
+        assert_large_payload_merged(merged, stats);
+    }
+
+    /// A merge reads its input in batches, so one batch can hold only nulls
+    /// in a column that has values elsewhere. The merged stats must still
+    /// carry that column's exact value counts.
+    #[test]
+    fn merge_keeps_value_counts_when_a_batch_is_all_null() {
+        /// Rows in the input: about three read batches.
+        const ROWS: usize = 3_000;
+        /// Leading rows with a null `category`: the whole first batch.
+        const NULL_ROWS: usize = 1_500;
+        const _: () = assert!(NULL_ROWS > 1024);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+            Field::new("category", DataType::Utf8, true),
+        ]));
+        let opts = BuilderOptions::new(
+            schema.clone(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let category = opts
+            .field_id_of_column("category")
+            .expect("category field id");
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(decimal128_ids((0..ROWS).map(|i| i as u64))),
+                Arc::new(LargeStringArray::from(vec!["word"; ROWS])),
+                Arc::new(StringArray::from_iter((0..ROWS).map(|i| {
+                    (i >= NULL_ROWS).then_some(if i % 2 == 0 { "a" } else { "b" })
+                }))),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let input = Arc::new(
+            SuperfileReader::open(Bytes::from(b.finish().expect("finish input")))
+                .expect("open input"),
+        );
+
+        let (_, stats) =
+            SuperfileBuilder::build_from_readers_fts_merge(&[(input, None)]).expect("merge");
+        let agg = stats.scalar_stats.get(&category).expect("category stats");
+        assert_eq!(agg.null_count, Some(NULL_ROWS as u64));
+        let counts: Vec<u64> = agg
+            .value_counts
+            .as_ref()
+            .expect("exact value counts survive the all-null batch")
+            .entries()
+            .iter()
+            .map(|(_, count)| *count)
+            .collect();
+        let half = ((ROWS - NULL_ROWS) / 2) as u64;
+        assert_eq!(counts, vec![half, half]);
+    }
+
+    /// The fallback merge, which re-encodes the vectors, over the same
+    /// input: Fp32 vectors cannot be merged as IVF, so compaction takes it.
+    #[test]
+    #[ignore = "allocates over 4 GiB; run with --release --ignored"]
+    fn fallback_merge_reads_input_with_string_column_over_2_gib() {
+        let opts = BuilderOptions::new(
+            large_payload_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![default_vector_config("emb", 7)],
+        );
+        let input = large_payload_input(opts, None);
+        let want = input
+            .vec()
+            .expect("vector reader")
+            .get_vectors_for_merge("emb")
+            .expect("input vectors");
+        let (merged, stats) = SuperfileBuilder::build_from_readers(&[(input, None)])
+            .expect("merge an input whose string column passes 2 GiB");
+        let got = SuperfileReader::open(Bytes::from(merged.clone()))
+            .expect("open merged")
+            .vec()
+            .expect("vector reader")
+            .get_vectors_for_merge("emb")
+            .expect("merged vectors");
+        assert_eq!(got, want, "every row keeps its own vector across batches");
+        assert_large_payload_merged(merged, stats);
+    }
+
+    /// Reindex's re-analysis over the same input: every row is indexed,
+    /// each under its own doc id.
+    #[test]
+    #[ignore = "allocates over 4 GiB; run with --release --ignored"]
+    fn reanalyze_reads_input_with_string_column_over_2_gib() {
+        let opts = BuilderOptions::new(
+            large_payload_schema(),
+            "doc_id",
+            vec![FtsConfig::new("title")],
+            vec![],
+        );
+        let input = large_payload_input(opts, None);
+        let mut b = SuperfileBuilder::new(
+            BuilderOptions::new_from_reader(&input).reanalyze_stored_columns(),
+        )
+        .expect("new SuperfileBuilder");
+        b.reanalyze_fts_from_reader(&input)
+            .expect("re-analyze an input whose string column passes 2 GiB");
+        b.set_carried_doc_count(LARGE_INPUT_ROWS as u64);
+        let mut out = Vec::new();
+        b.finish_carrying_body_to(&input, &mut out)
+            .expect("finish carrying the body");
+        let out = SuperfileReader::open(Bytes::from(out)).expect("open output");
+        // Every title is the one token "word".
+        let lengths = out
+            .fts()
+            .expect("fts reader")
+            .read_doc_lengths(0)
+            .expect("doc lengths");
+        assert_eq!(lengths, vec![1u32; LARGE_INPUT_ROWS]);
     }
 
     /// One merge input over `(title, body)` docs with ids from `first_id`.
@@ -6897,10 +7803,48 @@ mod tests {
         );
     }
 
-    // ---- Raw stable-id sidecar: read, then repacked on carry ----
+    // ---- Stable-id sidecar on a rewrite ----
 
-    /// Rows in the raw-sidecar fixture.
-    const RAW_SIDECAR_ROWS: u64 = 64;
+    /// Rows in the sidecar fixture.
+    const SIDECAR_ROWS: u64 = 64;
+
+    /// A `SIDECAR_ROWS`-row superfile with a packed id sidecar, the batch it
+    /// was built from, and the options that built it.
+    fn sidecar_fixture() -> (BuilderOptions, RecordBatch, Bytes) {
+        let opts = opts_minimal();
+        let titles: Vec<String> = (0..SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
+        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
+        let body = LargeStringArray::from(vec!["x"; SIDECAR_ROWS as usize]);
+        let batch = RecordBatch::try_new(
+            opts.schema.clone(),
+            vec![
+                Arc::new(decimal128_ids(0..SIDECAR_ROWS)),
+                Arc::new(title),
+                Arc::new(body),
+            ],
+        )
+        .expect("build RecordBatch");
+        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
+        b.add_batch(&batch, &[]).expect("add_batch");
+        let bytes = Bytes::from(b.finish().expect("finish builder"));
+        (opts, batch, bytes)
+    }
+
+    /// Rewrite `source` the way a reindex does: keep its body and FTS index,
+    /// and write the new file.
+    fn carry_rewrite(
+        opts: BuilderOptions,
+        source: &SuperfileReader,
+    ) -> Result<Vec<u8>, BuildError> {
+        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
+        carry
+            .carry_fts_from_reader_scoped(source, None, CarryScope::AllColumns)
+            .expect("carry the FTS blob");
+        carry.set_carried_doc_count(SIDECAR_ROWS);
+        let mut out = Vec::new();
+        carry.finish_carrying_body_to(source, &mut out)?;
+        Ok(out)
+    }
 
     /// `bytes` re-spliced with its stable-id sidecar in the raw layout — one
     /// little-endian `i128` per row of `batch`, and no layout key — the form
@@ -6942,26 +7886,11 @@ mod tests {
     /// through it, and a carried rewrite repacks it without moving an id.
     #[test]
     fn a_raw_id_sidecar_reads_and_is_repacked_on_carry() {
-        let opts = opts_minimal();
-        let titles: Vec<String> = (0..RAW_SIDECAR_ROWS).map(|i| format!("row {i}")).collect();
-        let title = LargeStringArray::from(titles.iter().map(String::as_str).collect::<Vec<_>>());
-        let body = LargeStringArray::from(vec!["x"; RAW_SIDECAR_ROWS as usize]);
-        let batch = RecordBatch::try_new(
-            opts.schema.clone(),
-            vec![
-                Arc::new(decimal128_ids(0..RAW_SIDECAR_ROWS)),
-                Arc::new(title),
-                Arc::new(body),
-            ],
-        )
-        .expect("build RecordBatch");
-        let mut b = SuperfileBuilder::new(opts.clone()).expect("new SuperfileBuilder");
-        b.add_batch(&batch, &[]).expect("add_batch");
-        let packed = Bytes::from(b.finish().expect("finish builder"));
+        let (opts, batch, packed) = sidecar_fixture();
         let raw = with_raw_id_sidecar(&packed, &batch);
 
         // Every row, out of order, so a mis-strided raw read cannot pass.
-        let locals: Vec<u32> = (0..RAW_SIDECAR_ROWS as u32).rev().collect();
+        let locals: Vec<u32> = (0..SIDECAR_ROWS as u32).rev().collect();
         let expected = SuperfileReader::open(packed)
             .expect("open packed superfile")
             .take_by_local_doc_ids(&locals, &["doc_id"])
@@ -6976,15 +7905,7 @@ mod tests {
             expected
         );
 
-        let mut carry = SuperfileBuilder::new(opts).expect("new SuperfileBuilder");
-        carry
-            .carry_fts_from_reader_scoped(&raw_reader, None, CarryScope::AllColumns)
-            .expect("carry the FTS blob");
-        carry.set_carried_doc_count(RAW_SIDECAR_ROWS);
-        let mut out = Vec::new();
-        carry
-            .finish_carrying_body_to(&raw_reader, &mut out)
-            .expect("carry the body");
+        let out = carry_rewrite(opts, &raw_reader).expect("carry the body");
         let repacked = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
         assert!(
             repacked.id_sidecar_is_packed(),
@@ -6995,6 +7916,32 @@ mod tests {
                 .take_by_local_doc_ids(&locals, &["doc_id"])
                 .expect("ids via the repacked sidecar"),
             expected
+        );
+    }
+
+    #[test]
+    fn a_carry_rebuilds_a_malformed_id_sidecar_block() {
+        // A superfile with one broken block in its id sidecar, rewritten the way
+        // a reindex does.
+        //  - `open` takes it, since it checks only the sidecar's header.
+        //  - the rewrite succeeds, with a sidecar rebuilt from the `_id` column.
+        //  - every block of the new sidecar is good, and every `_id` matches.
+        // This test pins that a rewrite repairs a bad block instead of failing.
+        let (opts, _, bytes) = sidecar_fixture();
+        let damaged = Bytes::from(ids::with_damaged_id_block(&bytes, 0));
+        let source = SuperfileReader::open(damaged).expect("open checks only the header");
+        let out = carry_rewrite(opts, &source).expect("the rewrite repairs the sidecar");
+
+        assert_eq!(ids::check_id_sidecar(&out), Ok(()));
+        let rewrite = SuperfileReader::open(Bytes::from(out)).expect("open the rewrite");
+        let locals: Vec<u32> = (0..SIDECAR_ROWS as u32).collect();
+        assert_eq!(
+            rewrite
+                .take_by_local_doc_ids(&locals, &["doc_id"])
+                .expect("read every _id")
+                .column(0)
+                .as_ref(),
+            &decimal128_ids(0..SIDECAR_ROWS) as &dyn Array,
         );
     }
 
@@ -8087,51 +9034,55 @@ mod tests {
         pack_cells_superfile_with_codec_dim(id_base, cells, rerank_codec, 16)
     }
 
+    /// `n` rows of cell `cell`, stable id `id_base + cell * 100 + i`, all
+    /// in cluster 0 with codes that differ per row.
+    fn sq8_cell_rows(
+        id_base: i128,
+        cell: u32,
+        n: usize,
+        rerank_codec: RerankCodec,
+        dim: usize,
+    ) -> Vec<MaterializedIvfRow> {
+        let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
+            if rerank_codec == RerankCodec::Sq8FixedResidual {
+                (
+                    Arc::from(vec![SQ8_FIXED_SCALE; dim]),
+                    Arc::from(vec![SQ8_FIXED_OFFSET; dim]),
+                )
+            } else {
+                (Arc::from(vec![1.0f32; dim]), Arc::from(vec![0.0f32; dim]))
+            };
+        (0..n)
+            .map(|i| {
+                let local = i as u32;
+                let stable_id = id_base + (cell as i128) * 100 + local as i128;
+                let mut codes = vec![0u8; dim];
+                codes[0] = (cell as u8).wrapping_add(i as u8);
+                MaterializedIvfRow {
+                    local_doc_id: local,
+                    stable_id,
+                    cluster: 0,
+                    rabitq_code: vec![0u8; dim.div_ceil(8)],
+                    encoded: EncodedCellRow {
+                        stable_id,
+                        rerank_codec,
+                        scale: Arc::clone(&scale),
+                        offset: Arc::clone(&offset),
+                        codes,
+                        residuals: vec![0u8; dim],
+                        norm_sq: Some(1.0),
+                    },
+                }
+            })
+            .collect()
+    }
+
     fn pack_cells_superfile_with_codec_dim(
         id_base: i128,
         cells: &[(u32, usize, usize)],
         rerank_codec: RerankCodec,
         dim: usize,
     ) -> Arc<SuperfileReader> {
-        use crate::superfile::vector::{
-            builder::build_merged_subsection_from_materialized,
-            cell_posting::{EncodedCellRow, MaterializedIvfRow},
-        };
-
-        let make_rows = |cell: u32, n: usize| -> Vec<MaterializedIvfRow> {
-            let (scale, offset): (Arc<[f32]>, Arc<[f32]>) =
-                if rerank_codec == RerankCodec::Sq8FixedResidual {
-                    (
-                        Arc::from(vec![SQ8_FIXED_SCALE; dim]),
-                        Arc::from(vec![SQ8_FIXED_OFFSET; dim]),
-                    )
-                } else {
-                    (Arc::from(vec![1.0f32; dim]), Arc::from(vec![0.0f32; dim]))
-                };
-            (0..n)
-                .map(|i| {
-                    let local = i as u32;
-                    let stable_id = id_base + (cell as i128) * 100 + local as i128;
-                    let mut codes = vec![0u8; dim];
-                    codes[0] = (cell as u8).wrapping_add(i as u8);
-                    MaterializedIvfRow {
-                        local_doc_id: local,
-                        stable_id,
-                        cluster: 0,
-                        rabitq_code: vec![0u8; dim.div_ceil(8)],
-                        encoded: EncodedCellRow {
-                            stable_id,
-                            rerank_codec,
-                            scale: Arc::clone(&scale),
-                            offset: Arc::clone(&offset),
-                            codes,
-                            residuals: vec![0u8; dim],
-                            norm_sq: Some(1.0),
-                        },
-                    }
-                })
-                .collect()
-        };
         let make_cfg = || VectorConfig {
             column: "emb".into(),
             dim,
@@ -8147,7 +9098,7 @@ mod tests {
         let mut ids: Vec<i128> = Vec::new();
         let mut packed = Vec::with_capacity(cells.len());
         for &(cell_id, n_rows, n_cent) in cells {
-            let rows = make_rows(cell_id, n_rows);
+            let rows = sq8_cell_rows(id_base, cell_id, n_rows, rerank_codec, dim);
             ids.extend(rows.iter().map(|r| r.stable_id));
             let sub = build_merged_subsection_from_materialized(make_cfg(), n_cent, rows)
                 .expect("cell subsection");
@@ -8228,8 +9179,64 @@ mod tests {
         );
     }
 
+    /// Rows spread over several batches come out in the asked order, across
+    /// chunks that each read a different mix of batches.
     #[test]
-    fn scalar_batch_in_stable_id_order_rejects_duplicate_ids() {
+    fn scalar_batches_in_stable_id_order_reorders_across_batches() {
+        /// Rows per input batch: smaller than a chunk, so a chunk reads many.
+        const ROWS_PER_BATCH: usize = 300;
+        /// Input batches, enough rows for several output chunks.
+        const N_BATCHES: usize = 10;
+        /// Step through the ids, coprime with the row count, to shuffle them.
+        const SHUFFLE_STEP: usize = 7;
+        const N: usize = ROWS_PER_BATCH * N_BATCHES;
+        const _: () = assert!(N > 2 * REORDER_CHUNK_ROWS);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("doc_id", DataType::Decimal128(38, 0), false),
+            Field::new("title", DataType::LargeUtf8, false),
+        ]));
+        let batches: Vec<RecordBatch> = (0..N_BATCHES)
+            .map(|b| {
+                let ids = b * ROWS_PER_BATCH..(b + 1) * ROWS_PER_BATCH;
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(decimal128_ids(ids.clone().map(|i| i as u64))),
+                        Arc::new(LargeStringArray::from_iter_values(
+                            ids.map(|i| format!("t{i}")),
+                        )),
+                    ],
+                )
+                .expect("batch")
+            })
+            .collect();
+        let ordered: Vec<i128> = (0..N).map(|i| ((i * SHUFFLE_STEP) % N) as i128).collect();
+
+        let out = scalar_batches_in_stable_id_order(&schema, "doc_id", &batches, &ordered)
+            .expect("reorder");
+        assert_eq!(out.len(), N.div_ceil(REORDER_CHUNK_ROWS));
+        let mut got = Vec::with_capacity(N);
+        for batch in &out {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal ids");
+            let titles = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .expect("titles");
+            for row in 0..batch.num_rows() {
+                assert_eq!(titles.value(row), format!("t{}", ids.value(row)));
+                got.push(ids.value(row));
+            }
+        }
+        assert_eq!(got, ordered);
+    }
+
+    #[test]
+    fn scalar_batches_in_stable_id_order_rejects_duplicate_ids() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
@@ -8245,7 +9252,7 @@ mod tests {
             ],
         )
         .expect("batch");
-        let err = scalar_batch_in_stable_id_order(&schema, "doc_id", &[batch], &[10, 11])
+        let err = scalar_batches_in_stable_id_order(&schema, "doc_id", &[batch], &[10, 11])
             .expect_err("duplicate stable_id must fail");
         assert!(
             matches!(err, BuildError::VectorSchemaMismatch(ref m) if m.contains("duplicate")),
@@ -8254,7 +9261,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_batch_in_stable_id_order_rejects_row_count_mismatch() {
+    fn scalar_batches_in_stable_id_order_rejects_row_count_mismatch() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("doc_id", DataType::Decimal128(38, 0), false),
             Field::new("title", DataType::LargeUtf8, false),
@@ -8271,7 +9278,7 @@ mod tests {
         )
         .expect("batch");
         // Two visible rows but only one ordered id — must not silently drop a row.
-        let err = scalar_batch_in_stable_id_order(&schema, "doc_id", &[batch], &[10])
+        let err = scalar_batches_in_stable_id_order(&schema, "doc_id", &[batch], &[10])
             .expect_err("ordered_ids/scalar len mismatch must fail");
         assert!(
             matches!(err, BuildError::VectorSchemaMismatch(ref m) if m.contains("ordered ids")),

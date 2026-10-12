@@ -187,18 +187,6 @@ pub struct Manifest {
     /// manifests, when the router is off at drain, or on a build failure
     /// (consumers reconstruct it in memory).
     pub slow_vector_state_centroid_graph: Option<RoutingRef>,
-    /// Global term-statistics sidecar: a content-addressed artifact
-    /// holding gross `df` per (column, term) summed over a recorded set
-    /// of this table's superfiles, so a global-stats BM25 query reads
-    /// corpus-wide df in one lookup instead of fanning over every
-    /// superfile's dictionary. Written by maintenance (optimize);
-    /// **carried through appends** (new superfiles are simply uncovered
-    /// tail the query tops up from their own dictionaries) and
-    /// **dropped by any commit that removes superfiles** (a removed
-    /// superfile's contribution is baked into the sum and cannot be
-    /// attributed, so only a fresh maintenance pass may republish).
-    /// Absent on older manifests and until the first maintenance pass.
-    pub term_stats: Option<RoutingRef>,
     /// The table-level term index root (`manifest::term_index`), when
     /// one has been built. Carried across every commit: its postings are
     /// per superfile, so a removal leaves it valid (a reader ignores
@@ -1007,6 +995,8 @@ impl ScalarStatsAgg {
     /// this signals corruption or a logic bug; the caller decides how to
     /// degrade (see [`ScalarStatsAgg::merge_tables`]).
     pub fn merge_with(&mut self, other: &ScalarStatsAgg) -> Result<(), ScalarStatsMergeError> {
+        // Read before the bounds below are overwritten.
+        let (self_has_values, other_has_values) = (self.has_values(), other.has_values());
         // Resolve the bounds first; bail before mutating anything so a failed
         // merge can't leave half-updated, internally-inconsistent stats.
         let Some((min, max)) = merge_min_max_arrays(&self.min, &other.min, &self.max, &other.max)
@@ -1036,11 +1026,21 @@ impl ScalarStatsAgg {
             },
             _ => None,
         };
+        // A side with no non-null values has no counts to give, and adds
+        // nothing to the other side's.
         self.value_counts = match (&self.value_counts, &other.value_counts) {
             (Some(left), Some(right)) => left.merged_with(right),
+            (counts, None) if !other_has_values => counts.clone(),
+            (None, counts) if !self_has_values => counts.clone(),
             _ => None,
         };
         Ok(())
+    }
+
+    /// Whether the column holds any non-null value: min/max are null only
+    /// when it holds none.
+    fn has_values(&self) -> bool {
+        self.min.null_count() < self.min.len()
     }
 
     /// Merge two per-column scalar-stats tables
@@ -1377,10 +1377,6 @@ struct ManifestDto {
     slow_vector_state_centroid_graph_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     slow_vector_state_centroid_graph_content_hash: Option<String>, // "blake3:<64hex>"
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    term_stats_uri: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    term_stats_content_hash: Option<String>, // "blake3:<64hex>"
     #[serde(default, skip_serializing_if = "Option::is_none")]
     term_index_uri: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1921,11 +1917,11 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
     Ok(ManifestDto {
         // Stamped at the one wire exit, whatever the decoded list carried, so
         // no construction site can write id-keyed aggregates under the older
-        // name-keyed major. A maintenance publish (term stats, term index, a
-        // schema stamp) clones a decoded list and edits it in place; carrying
-        // its version forward would label new content with the old major, and
-        // the next decode would resolve id keys as column names and silently
-        // drop every aggregate. Mirrors `part::encode_with_mode`.
+        // name-keyed major. A maintenance publish (term index, schema stamp)
+        // clones a decoded list and edits it in place; carrying its version
+        // forward would label new content with the old major, and the next
+        // decode would resolve id keys as column names and silently drop
+        // every aggregate. Mirrors `part::encode_with_mode`.
         format_version: FORMAT_VERSION.to_owned(),
         manifest_id: l.manifest_id,
         options_hash: encode_hash(&l.options_hash),
@@ -1970,8 +1966,6 @@ fn list_to_dto(l: &Manifest) -> Result<ManifestDto, ListEncodeError> {
             .slow_vector_state_centroid_graph
             .as_ref()
             .map(|r| encode_hash(&r.content_hash)),
-        term_stats_uri: l.term_stats.as_ref().map(|r| r.uri.clone()),
-        term_stats_content_hash: l.term_stats.as_ref().map(|r| encode_hash(&r.content_hash)),
         term_index_uri: l.term_index.as_ref().map(|r| r.uri.clone()),
         term_index_content_hash: l.term_index.as_ref().map(|r| encode_hash(&r.content_hash)),
         term_index_complete: l.term_index_complete,
@@ -2099,13 +2093,6 @@ fn list_from_dto(d: ManifestDto, legacy: &LegacyNames) -> Result<Manifest, ListP
             d.slow_vector_state_centroid_graph_uri,
             d.slow_vector_state_centroid_graph_content_hash.as_deref(),
         ) {
-            (Some(uri), Some(hash)) => Some(RoutingRef {
-                uri,
-                content_hash: decode_hash(hash)?,
-            }),
-            _ => None,
-        },
-        term_stats: match (d.term_stats_uri, d.term_stats_content_hash.as_deref()) {
             (Some(uri), Some(hash)) => Some(RoutingRef {
                 uri,
                 content_hash: decode_hash(hash)?,
@@ -2409,6 +2396,36 @@ mod tests {
         assert!(a.null_count.is_none());
         assert!(a.hll.is_none());
         assert!(a.value_counts.is_none());
+    }
+
+    /// A side with no non-null values (an all-null batch of the column)
+    /// adds nothing to exact value counts, so merging it keeps them.
+    #[test]
+    fn scalar_agg_merge_keeps_value_counts_across_an_all_null_side() {
+        let values: ArrayRef = Arc::new(StringArray::from(vec!["rust", "go", "rust"]));
+        let nulls: ArrayRef = Arc::new(StringArray::from(vec![None::<&str>, None]));
+        let counted = ScalarStatsAgg::from_column(&values).expect("utf8 stats");
+        let all_null = ScalarStatsAgg::from_column(&nulls).expect("utf8 stats");
+        assert!(all_null.value_counts.is_none());
+        let want = [
+            (ScalarValue::Utf8(Some("go".into())), 1),
+            (ScalarValue::Utf8(Some("rust".into())), 2),
+        ];
+        for (mut left, right) in [
+            (counted.clone(), all_null.clone()),
+            (all_null.clone(), counted.clone()),
+        ] {
+            left.merge_with(&right).expect("same type merges");
+            assert_eq!(
+                left.value_counts.expect("counts kept").entries(),
+                &want,
+                "an all-null side adds nothing"
+            );
+            assert_eq!(left.null_count, Some(2));
+        }
+        let mut both = all_null.clone();
+        both.merge_with(&all_null).expect("same type merges");
+        assert!(both.value_counts.is_none(), "no values on either side");
     }
 
     #[test]
@@ -2741,7 +2758,6 @@ mod tests {
             slow_vector_state_centroids: None,
             slow_vector_state_graphs: None,
             slow_vector_state_centroid_graph: None,
-            term_stats: None,
             term_index: None,
             term_index_complete: false,
             parts: vec![],
@@ -3443,39 +3459,17 @@ mod tests {
         );
     }
 
+    /// A list carrying a key this engine does not know still decodes, and
+    /// re-encoding drops the key, so tables written by other engine versions
+    /// keep opening.
     #[test]
-    fn term_stats_ref_round_trips_and_requires_both_halves() {
-        let mut list = empty_list();
-        list.term_stats = Some(RoutingRef {
-            uri: "term-stats/stats-abc.bin".into(),
-            content_hash: ContentHash([7u8; 32]),
-        });
-        let bytes = encode(&list).expect("encode");
-        let decoded = decode(&bytes, &LegacyNames::none()).expect("decode");
-        assert_eq!(decoded.term_stats, list.term_stats);
-        // A manifest without the field decodes to None (older writers).
-        let empty_bytes = encode(&empty_list()).expect("encode empty");
-        let s = from_utf8(&empty_bytes).expect("utf8");
-        assert!(
-            !s.contains("term_stats"),
-            "absent ref must not appear on the wire (older manifests stay byte-identical)"
-        );
-        assert!(
-            decode(&empty_bytes, &LegacyNames::none())
-                .expect("decode empty")
-                .term_stats
-                .is_none()
-        );
-        // One half without the other is treated as no ref, like the
-        // centroid/graph refs.
-        let with_ref = from_utf8(&bytes).expect("utf8");
-        let uri_only = with_ref.replacen("term_stats_content_hash", "term_stats_ignored", 1);
-        assert!(
-            decode(uri_only.as_bytes(), &LegacyNames::none())
-                .expect("decode uri-only")
-                .term_stats
-                .is_none()
-        );
+    fn unknown_keys_are_ignored_on_decode() {
+        let bytes = encode(&empty_list()).expect("encode");
+        let text = from_utf8(&bytes).expect("utf8");
+        let with_unknown = text.replacen('{', r#"{"not_a_manifest_key": "value","#, 1);
+        let decoded =
+            decode(with_unknown.as_bytes(), &LegacyNames::none()).expect("decode with unknown key");
+        assert_eq!(encode(&decoded).expect("re-encode"), bytes);
     }
 
     #[test]
@@ -3839,8 +3833,8 @@ mod tests {
 
     /// A list decoded from the name-keyed major and re-encoded must come back
     /// at the id-keyed major, because the encoder always writes id keys. The
-    /// maintenance publishes (term stats, term index, a schema stamp) clone a
-    /// decoded list and edit it, so this is the shape they take.
+    /// maintenance publishes (term index, schema stamp) clone a decoded list
+    /// and edit it, so this is the shape they take.
     #[test]
     fn a_re_encoded_legacy_list_carries_the_current_major() {
         let bytes = restamped(&empty_list(), "1.0");
