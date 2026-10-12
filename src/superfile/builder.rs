@@ -2618,7 +2618,6 @@ impl SuperfileBuilder {
                     .map(|f| f.fts_columns_config().collect::<Vec<_>>())
                     .as_deref(),
             )?;
-            let start = std::time::Instant::now();
             // When an ordered batch is supplied, the caller may already have
             // decoded the inputs and computed their statistics.
             let record_batch = if ordered_batch.is_none() || !stats_are_precomputed {
