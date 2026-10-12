@@ -1422,13 +1422,10 @@ impl SuperfileBuilder {
         Ok(())
     }
 
-    /// Append a scalar-only batch (ids without vector payloads). Used when the
-    /// vector blob is supplied separately via a prebuilt IVF subsection. The
-    /// FTS blob is likewise supplied out of band: merge callers carry each
-    /// input's prebuilt postings across (`carry_fts_from_reader_scoped` /
-    /// [`Self::carry_fts_postings_with_remap`]) — this method never
-    /// tokenizes, so feeding it rows without also carrying their postings
-    /// under-indexes the file.
+    /// Append a scalar-only batch (IDs without vector payloads). Used when the
+    /// vector blob is supplied separately via a prebuilt IVF subsection.
+    /// This method does not tokenize FTS columns, so callers must ensure the
+    /// corresponding postings are supplied separately when the builder has FTS.
     pub(crate) fn add_batch_ids_only(&mut self, batch: &RecordBatch) -> Result<(), BuildError> {
         if !same_shape(&batch.schema(), &self.opts.schema) {
             return Err(BuildError::BatchSchemaMismatch {
@@ -1511,9 +1508,9 @@ impl SuperfileBuilder {
         Ok(())
     }
 
-    /// Append the input's surviving document lengths and return its doc-ID
-    /// remap, or `None` when there is no FTS to carry. The caller carries
-    /// the postings separately.
+    /// The ordinary carry path preserves arrival order: surviving input rows
+    /// map to dense output IDs beginning at `base`. A reordered merge computes
+    /// its own row-to-document mapping and scatters document lengths separately.
     fn carry_fts_doc_lengths(
         &mut self,
         reader: &SuperfileReader,
@@ -1596,16 +1593,19 @@ impl SuperfileBuilder {
         self.carry_fts_postings_with_remap_scoped(reader, remap, CarryScope::AllColumns)
     }
 
-    // Apply the same FTS compatibility check here for callers that feed
-    // postings directly, such as the multi-cell merge.
+    /// Carry an input's prebuilt FTS postings into this builder, remapping
+    /// input-local document IDs through `remap`.
+    ///
+    /// `None` entries drop postings for deleted or otherwise excluded rows.
+    /// The caller is responsible for placing document lengths in output order.
     fn carry_fts_postings_with_remap_scoped(
         &mut self,
         reader: &SuperfileReader,
         remap: &[Option<FtsDocId>],
         scope: CarryScope,
     ) -> Result<(), BuildError> {
-        // Same compatibility gate as `carry_fts_from_reader`, so callers
-        // that feed this directly (the multi-cell merge) get it too.
+        // Validate compatibility before carrying any postings, including when
+        // this method is called independently of carry_fts_from_reader_scoped.
         let remote_cfg = reader
             .fts()
             .map(|f| f.fts_columns_config().collect::<Vec<_>>());
@@ -1801,7 +1801,7 @@ impl SuperfileBuilder {
         let merged_sub = merge_sq8_ivf_subsections(&merge_inputs)?;
         superfile_builder.set_prebuilt_ivf_subsection(0, merged_sub)?;
 
-        let stats = Self::fts_and_parquet_merge_half(
+        let stats = Self::merge_rows_to(
             superfile_builder,
             inputs,
             rows_of,
@@ -2149,10 +2149,10 @@ impl SuperfileBuilder {
             // replacement), instead of a hard schema error.
             return Ok(SuperfileStats::from_children(&[]));
         }
-        // Parquet rows must follow the same cell-directory order as the packed
-        // IVF subsections. Hidden index files are `_id`-only; user MultiCell
-        // files carry the full scalar schema (title, …) and must be reordered
-        // by stable id — not replaced with an id-only batch.
+        // Build the mapping from each input document to its output Parquet row.
+        // The input batches remain grouped by source so their stable IDs can be
+        // matched to the packed-cell order. Remove IDs as they are claimed so a
+        // superseded cell and its replacement cannot both map to the same output row.
         let rows_of = if superfile_builder.fts_builder.is_some() {
             let id_idx = scalar_schema
                 .index_of(&id_column)
@@ -2228,7 +2228,7 @@ impl SuperfileBuilder {
 
         superfile_builder.set_prebuilt_multi_cell_ivfs(packed_cells)?;
 
-        let mut stats = Self::fts_and_parquet_merge_half(
+        let mut stats = Self::merge_rows_to(
             superfile_builder,
             inputs,
             rows_of,
@@ -2767,7 +2767,7 @@ impl SuperfileBuilder {
             n_out_docs += kept;
             rows_of.push(rows);
         }
-        Self::fts_and_parquet_merge_half(
+        Self::merge_rows_to(
             superfile_builder,
             inputs,
             rows_of,
@@ -2778,7 +2778,7 @@ impl SuperfileBuilder {
         )
     }
 
-    fn fts_and_parquet_merge_half<W: Write>(
+    fn merge_rows_to<W: Write>(
         mut superfile_builder: SuperfileBuilder,
         inputs: &[MergeInput],
         rows_of: Vec<Vec<Option<RowId>>>,
@@ -2787,10 +2787,10 @@ impl SuperfileBuilder {
         ordered: Option<(Vec<RecordBatch>, Vec<SuperfileStats>)>,
         output: W,
     ) -> Result<SuperfileStats, BuildError> {
-        // Encode the Parquet body incrementally: each input's surviving rows are
-        // written and dropped in the loop below, so the body holds at most one
-        // input's batch plus the writer's row-group buffer — never the whole
-        // corpus in `self.batches`. This is the lever that bounds merge RSS.
+        // Stream the Parquet body through the encoder rather than buffering the
+        // finished body in the builder. Ordinary merges read one input at a time;
+        // the multi-cell path supplies preordered batches and retains them until
+        // they are written.
         let mut body_encoder = {
             let id_page_limit = [(
                 superfile_builder.opts.id_column.as_str(),
