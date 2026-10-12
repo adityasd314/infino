@@ -2844,14 +2844,14 @@ impl SuperfileBuilder {
         // id a row is stored under.
         let new_of_row: Option<Vec<u32>> = if superfile_builder.fts_builder.is_none() {
             None
-        } else if ordered_batches.is_some() {
-            Some((0..n_out_docs).collect())
         } else {
             order.as_ref().map(|o| {
                 let mut inv = vec![0u32; o.len()];
+
                 for (new_id, &row) in o.iter().enumerate() {
                     inv[row as usize] = new_id as u32;
                 }
+
                 inv
             })
         };
