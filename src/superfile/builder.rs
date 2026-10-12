@@ -2211,14 +2211,16 @@ impl SuperfileBuilder {
         };
 
         // Flatten once, then reorder scalar rows to match the packed-cell order.
-        let scalar_batches: Vec<RecordBatch> = scalar_batches.into_iter().flatten().collect();
+        let input_batches: Vec<RecordBatch> = scalar_batches.into_iter().flatten().collect();
 
         let scalar_batches = scalar_batches_in_stable_id_order(
             &scalar_schema,
             &id_column,
-            &scalar_batches,
+            &input_batches,
             &all_stable_ids,
         )?;
+
+        drop(input_batches);
 
         // Compute statistics from the actual output batches, excluding superseded rows.
         let stats_collector = scalar_batches
