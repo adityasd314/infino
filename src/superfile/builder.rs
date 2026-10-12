@@ -2842,19 +2842,21 @@ impl SuperfileBuilder {
         };
         // The inverse, which is what the per-input remap needs: the doc
         // id a row is stored under.
+
         let new_of_row: Option<Vec<u32>> = if superfile_builder.fts_builder.is_none() {
             None
+        } else if ordered_batches.is_some() && order.is_none() {
+            Some((0..n_out_docs).collect())
         } else {
             order.as_ref().map(|o| {
                 let mut inv = vec![0u32; o.len()];
-
                 for (new_id, &row) in o.iter().enumerate() {
                     inv[row as usize] = new_id as u32;
                 }
-
                 inv
             })
         };
+
         // Doc lengths are scattered rather than appended when the order
         // moves, so they are collected per column and pushed once.
         let mut out_lengths: Vec<Vec<u32>> = match new_of_row.is_some() {
@@ -2943,6 +2945,7 @@ impl SuperfileBuilder {
                             &format!("fts merge input {idx}"),
                             &mut out_lengths,
                         )?;
+
                         match merge {
                             PostingMerge::TermByTerm => sorted_inputs.push(SortedInput {
                                 reader: Arc::clone(reader),
