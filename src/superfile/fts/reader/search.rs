@@ -1131,7 +1131,7 @@ impl FtsReader {
         idf: QueryIdf<'_>,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         let set = self.build_or_cursor_set(column, terms, idf, None).await?;
-        self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor)
+        self.search_or_range_prebuilt(&set, k, doc_id_start, doc_id_end, floor, None)
     }
 
     /// Build the OR cursors for `terms` once — the postings fetch and
@@ -1171,6 +1171,9 @@ impl FtsReader {
     /// [`Self::search_or_range_pretokenized_with_floor`] delegates here.
     /// The ranged path carries no negation in v1.
     ///
+    /// `allow`, when set, restricts ranking to those rows (`local_doc_id`s):
+    /// docs outside it never enter the top-k. `None` ranks every row.
+    ///
     /// Runs the same windowed MaxScore union kernel as the single-shot path, so
     /// a query runs the identical kernel whether or not the fan-out sliced it —
     /// hardcoding a single-regime scorer here once caused an 11-24x post-compact
@@ -1182,11 +1185,15 @@ impl FtsReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        allow: Option<std::sync::Arc<roaring::RoaringBitmap>>,
     ) -> Result<Vec<(RowId, f32)>, FtsError> {
         if set.cursors.is_empty() || k == 0 || doc_id_start >= doc_id_end {
             return Ok(Vec::new());
         }
         let cursors = set.cursors.clone();
+        let mut gate = allow.map(|rows| {
+            ExcludeFilter::with_allow(Vec::new(), Some(RowSet::new(rows)), self.doc_map.clone())
+        });
         // The range is a slice of the blob's id space, taken to split one
         // superfile across threads; it carries no row meaning, so a
         // reordered blob slices exactly as an unreordered one does.
@@ -1194,7 +1201,7 @@ impl FtsReader {
             set.column_id,
             cursors,
             k,
-            None,
+            gate.as_mut(),
             floor.next_down(),
             doc_id_start,
             doc_id_end,
@@ -3124,13 +3131,103 @@ mod tests {
                 .await
                 .expect("fresh ranged search");
             let pre = r
-                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY)
+                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY, None)
                 .expect("prebuilt ranged search");
             let fresh_bits: Vec<(u32, u32)> =
                 fresh.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             let pre_bits: Vec<(u32, u32)> =
                 pre.iter().map(|&(d, s)| (d.get(), s.to_bits())).collect();
             assert_eq!(pre_bits, fresh_bits, "window ({lo},{hi})");
+        }
+    }
+
+    /// A ranged slice with an allow-set ranks only admitted rows, so it
+    /// fills `k` from them. Without the gate a slice cuts its top-k first and
+    /// a caller that drops deleted rows afterwards is left short — the
+    /// under-fill a tombstoned superfile showed.
+    #[tokio::test]
+    async fn search_or_range_prebuilt_honors_allow_set() {
+        /// Docs in the planted corpus (several OR windows and blocks).
+        const N_DOCS: u32 = 6_000;
+        /// Ask for every match, to read the whole ranking of a window.
+        const K_ALL: usize = N_DOCS as usize;
+
+        let mut b = FtsBuilder::new();
+        b.register_column("body".into(), false).expect("register");
+        for i in 0..N_DOCS {
+            let mut text = String::new();
+            for (t, name) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
+                let h = i.wrapping_mul(31).wrapping_add(t as u32 * 17) % 5;
+                for _ in 0..h {
+                    text.push_str(name);
+                    text.push(' ');
+                }
+            }
+            if text.is_empty() {
+                text.push_str("filler");
+            }
+            b.add_doc(0, i, &text).expect("add");
+        }
+        let blob = Bytes::from(b.finish().expect("finish"));
+        let json = r#"[{"name":"body","tokenizer":"standard","k1":1.2,"b":0.75}]"#;
+        let r = FtsReader::open(blob, json).expect("open");
+
+        let terms: &[&str] = &["alpha", "beta", "gamma", "delta"];
+        let set = r
+            .build_or_cursor_set("body", terms, QueryIdf::ThisFile, None)
+            .await
+            .expect("set");
+
+        // Delete the best-scoring docs of the whole corpus, plus a
+        // scattered tail, so the ungated top-k is mostly deleted rows.
+        let everything = r
+            .search_or_range_prebuilt(&set, K_ALL, 0, N_DOCS, f32::NEG_INFINITY, None)
+            .expect("ungated ranking");
+        let mut deleted: RoaringBitmap =
+            everything.iter().take(200).map(|&(d, _)| d.get()).collect();
+        deleted.extend((0..N_DOCS).step_by(7));
+        let mut live = RoaringBitmap::new();
+        live.insert_range(0..N_DOCS);
+        live -= &deleted;
+        let live = Arc::new(live);
+
+        let windows = [(0u32, N_DOCS), (0, 3_000), (2_000, 4_097), (3_000, N_DOCS)];
+        for (lo, hi) in windows {
+            // The window's whole ranking, restricted to live rows.
+            let expected: Vec<u32> = r
+                .search_or_range_prebuilt(&set, K_ALL, lo, hi, f32::NEG_INFINITY, None)
+                .expect("window ranking")
+                .iter()
+                .filter(|&&(d, _)| live.contains(d.get()))
+                .map(|&(_, s)| s.to_bits())
+                .collect();
+            for k in [1usize, 5, 50, 500] {
+                let got = r
+                    .search_or_range_prebuilt(
+                        &set,
+                        k,
+                        lo,
+                        hi,
+                        f32::NEG_INFINITY,
+                        Some(Arc::clone(&live)),
+                    )
+                    .expect("gated ranged search");
+                assert!(
+                    got.iter().all(|&(d, _)| live.contains(d.get())),
+                    "window ({lo},{hi}) k={k}: a deleted row was ranked"
+                );
+                assert_eq!(
+                    got.len(),
+                    k.min(expected.len()),
+                    "window ({lo},{hi}) k={k}: k must be filled from live rows"
+                );
+                let got_scores: Vec<u32> = got.iter().map(|&(_, s)| s.to_bits()).collect();
+                assert_eq!(
+                    got_scores,
+                    expected[..got.len()],
+                    "window ({lo},{hi}) k={k}: scores must be the live top-k"
+                );
+            }
         }
     }
 

@@ -2356,10 +2356,11 @@ impl SuperfileReader {
         doc_id_start: u32,
         doc_id_end: u32,
         floor: f32,
+        allow: Option<Arc<RoaringBitmap>>,
         scoring: &ScoringView<'_>,
     ) -> Result<Vec<(RowId, f32)>, ReadError> {
         let fts = self.fts_scored(scoring)?;
-        Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor)?)
+        Ok(fts.search_or_range_prebuilt(set, k, doc_id_start, doc_id_end, floor, allow)?)
     }
 
     /// Multi-column BM25 search with per-column weights ("most

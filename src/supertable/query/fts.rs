@@ -1419,10 +1419,9 @@ impl SupertableReader {
         let kept_refs: Vec<&Arc<SuperfileEntry>> = kept.iter().collect();
         // Phrase-bearing queries stay per-superfile: the ranged
         // kernel is the pure term-union fast path. So does a search
-        // with a per-row scope — the ranged union kernel carries no
-        // admission gate, only the clause kernels do. A scope whose
-        // candidate sets admit every row of every kept superfile gates
-        // nothing, so it is dropped here and the fast path stays open.
+        // with a per-row scope. A scope whose candidate sets admit every
+        // row of every kept superfile gates nothing, so it is dropped here
+        // and the fast path stays open.
         let per_row_scope: Option<Arc<HashMap<SuperfileUri, Arc<RoaringBitmap>>>> = scope
             .filter(|s| s.bounds_rows(&kept))
             .and_then(|s| s.allow.clone())
@@ -1464,6 +1463,7 @@ impl SupertableReader {
         let neg_ph_arc: Arc<Vec<Phrase<String>>> = Arc::new(negative_phrases);
         let column_field_id = self.manifest().field_id(column);
         let column_arc = Arc::new(column_owned);
+<<<<<<< HEAD
         // Exact count only: each superfile's row count, to turn its
         // tombstones into an allow-set, and the running total.
         // What a live-row set is built against: every kept superfile's
@@ -1472,6 +1472,12 @@ impl SupertableReader {
             true => kept.iter().map(|e| (e.superfile_id, e.n_docs)).collect(),
             false => HashMap::new(),
         });
+=======
+        // Each superfile's row count, to turn its tombstones into an
+        // allow-set, and (exact count only) the running total.
+        let row_counts: Arc<HashMap<Uuid, u64>> =
+            Arc::new(kept.iter().map(|e| (e.superfile_id, e.n_docs)).collect());
+>>>>>>> 7dc3d01 (fts: fill top-k from live rows on tables with deletes)
         let total = Arc::new(AtomicU64::new(0));
         let count_handle = Arc::clone(&total);
 
@@ -1628,13 +1634,13 @@ impl SupertableReader {
                         None => tombstones.as_ref().map(|c| c.bitmap_for(suid, now)),
                     };
                     // The atom walks may also read the floor LIVE mid-walk and
-                    // publish their own local kth into it — but a kernel heap
-                    // is pre-tombstone-filter, so only a superfile with no
-                    // tombstoned rows may participate: its local kth is a
-                    // floor the merge (which sees only surviving scores) can
-                    // never contradict. The sidecars were warmed by the
-                    // dispatcher, so this lookup is an in-memory hit; on a
-                    // miss/error the unit just keeps the snapshot floor.
+                    // publish their own local kth into it. A tombstoned
+                    // superfile stays out of that exchange: its heap holds
+                    // only live rows (the allow-set below), but it is the
+                    // conservative choice to let only untouched superfiles
+                    // publish. The sidecars were warmed above, so this
+                    // lookup is an in-memory hit; on a miss/error the unit
+                    // just keeps the snapshot floor.
                     let live_floor = if exact_count {
                         None
                     } else {
@@ -1644,12 +1650,17 @@ impl SupertableReader {
                             _ => Some(shared.live_floor()),
                         }
                     };
+<<<<<<< HEAD
                     // A superfile with deleted rows admits only its live
                     // rows: a kernel's heap then holds the k best live
                     // documents, where the filter after the walk would have
                     // dropped the deleted among the k best of all (and an
                     // exact count counts the live rows alone, as `count`
                     // does).
+=======
+                    // Gate deleted rows out of the heap rather than post-filtering: a top-k
+                    // cut before the tombstone filter under-fills k.
+>>>>>>> 7dc3d01 (fts: fill top-k from live rows on tables with deletes)
                     let allow = match &tomb {
                         Some(Ok(deleted)) if !deleted.is_empty() => {
                             let rows = row_counts.get(&suid).copied().ok_or_else(|| {
@@ -1719,6 +1730,7 @@ impl SupertableReader {
                         // more than the scan — see the gate's doc comment.
                         if should_arc.len() >= RANGED_KERNEL_POOL_MIN_TERMS {
                             let kernel_reader = Arc::clone(&r);
+                            let kernel_allow = allow.clone();
                             let kernel_set = Arc::clone(set);
                             let kernel_stats = op_stats.clone();
                             let kernel_column = column_arc.clone();
@@ -1733,6 +1745,7 @@ impl SupertableReader {
                                             start,
                                             end,
                                             floor,
+                                            kernel_allow,
                                             &table_scoring(&kernel_column, bm25_params, avgdl),
                                         )
                                     })
@@ -1742,7 +1755,9 @@ impl SupertableReader {
                             .map_err(|e| QueryError::Internal(e.to_string()))??
                         } else {
                             op_stats::timed_kernel(&op_stats, || {
-                                r.bm25_search_or_range_prebuilt(set, k, start, end, floor, &scoring)
+                                r.bm25_search_or_range_prebuilt(
+                                    set, k, start, end, floor, allow, &scoring,
+                                )
                             })?
                         }
                     }
@@ -5440,6 +5455,48 @@ mod tests {
             assert!(
                 hits.iter().all(|h| h.local_doc_id != 1),
                 "the deleted row is not a hit"
+            );
+        }
+    }
+
+    /// Ranked search fills `k` from live rows. Each superfile's kernel used
+    /// to cut its top-k before the tombstone filter ran, so deleting the
+    /// best-scoring row left `k = 1` with nothing and `k = 2` with one hit
+    /// while `count` still reported two matches.
+    #[test]
+    fn bm25_search_fills_k_after_deleting_the_top_hit() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        w.append(&build_batch(
+            0,
+            &["alpha alpha alpha", "alpha one two three", "alpha two"],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let stats = st
+            .delete(col("title").eq(lit("alpha alpha alpha")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader.count("title", "alpha", BoolMode::Or).expect("count"),
+            2
+        );
+        for k in [1usize, 2, 10] {
+            let hits = reader
+                .bm25_hits("title", "alpha", k, Bm25SearchOptions::new())
+                .expect("bm25_hits");
+            assert_eq!(hits.len(), k.min(2), "k={k} must be filled from live rows");
+            assert!(
+                hits.iter().all(|h| h.local_doc_id != 0),
+                "k={k}: the deleted row must not be a hit"
             );
         }
     }
