@@ -5446,6 +5446,53 @@ mod tests {
         }
     }
 
+    /// Ranked search fills `k` from live rows. Deleting the best-scoring
+    /// row must not leave a top-k short: the next-best live rows take its
+    /// place, in score order, for every `k` up to the live match count.
+    #[test]
+    fn bm25_search_fills_k_after_deleting_the_top_hit() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(LocalFsStorageProvider::new(dir.path()).expect("provider"));
+        let st = Supertable::create(options_one_superfile_per_commit().with_storage(storage))
+            .expect("create");
+        let mut w = st.writer().expect("writer");
+        // One match per row with a distinct length, so the order is fixed:
+        // the shorter the row, the higher its BM25 score.
+        w.append(&build_batch(
+            0,
+            &[
+                "alpha alpha alpha",
+                "alpha one two three",
+                "alpha two",
+                "alpha",
+            ],
+        ))
+        .expect("append");
+        w.commit().expect("commit");
+        drop(w);
+
+        let stats = st
+            .delete(col("title").eq(lit("alpha alpha alpha")))
+            .expect("delete");
+        assert_eq!(stats.matched(), 1);
+
+        let reader = st.reader().expect("reader");
+        assert_eq!(
+            reader.count("title", "alpha", BoolMode::Or).expect("count"),
+            3
+        );
+        // The live rows, best first (row 0 is the deleted one).
+        let live_by_score = [3u32, 2, 1];
+        for k in [1usize, 2, 3] {
+            let hits = reader
+                .bm25_hits("title", "alpha", k, Bm25SearchOptions::new())
+                .expect("bm25_hits");
+            let ids: Vec<u32> = hits.iter().map(|h| h.local_doc_id).collect();
+            assert_eq!(ids, live_by_score[..k], "k={k}: the k best live rows");
+        }
+    }
+
     /// Like [`options_one_superfile_per_commit`] but with the `title`
     /// column positions-indexed, so phrase queries are answerable.
     fn options_positions_one_superfile_per_commit() -> SupertableOptions {
