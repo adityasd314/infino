@@ -111,12 +111,15 @@ jobs:
           }
           refuse() { echo "go=false" >> "$GITHUB_OUTPUT"; echo "::notice::$1 has no write access; nothing to do"; exit 0; }
           if [ "$EVENT" = "issue_comment" ]; then
-            # The command is the comment's first non-blank line, so leading blank lines do not hide it.
-            command=$(printf '%s\n' "$COMMENT" | tr -d '\r' | awk 'NF { print $1; exit }')
-            case "$command" in
-              /autofix) mode=autofix;;
-              *) echo "go=false" >> "$GITHUB_OUTPUT"; echo "not a loop command"; exit 0;;
-            esac
+            # Check if anywhere in the comment we have `/autofix`
+            if [[ "$COMMENT" == *"/autofix"* ]]; then
+              mode=autofix
+            else
+              echo "go=false" >> "$GITHUB_OUTPUT"
+              echo "not a loop command"
+              exit 0
+            fi
+
             allowed "$COMMENTER" || refuse "$COMMENTER"
             # 👀 on the command: it was seen and a run is starting. A reaction that fails starts the run anyway.
             gh api -X POST "repos/$REPO/issues/comments/$COMMENT_ID/reactions" -f content=eyes --silent || true
