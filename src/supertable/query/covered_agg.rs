@@ -87,7 +87,7 @@ use arrow_schema::{DataType, Field, Schema};
 use datafusion::{
     catalog::TableProvider,
     common::{
-        DFSchema, ScalarValue,
+        Column, DFSchema, ScalarValue,
         tree_node::{Transformed, TreeNodeRecursion},
     },
     datasource::{DefaultTableSource, MemTable, provider_as_source},
@@ -278,12 +278,13 @@ pub(crate) async fn prepare_aggregate_inputs(
 ) -> Result<(), QueryError> {
     let mut sources: Vec<Arc<dyn TableSource>> = Vec::new();
     let mut aggregated: Vec<Arc<dyn TableSource>> = Vec::new();
-    // Whether the plan groups and reads a table with a `keyword` column.
+    // Whether the plan groups (`SELECT DISTINCT` is planned as a grouping
+    // only once optimized) and reads a table with a `keyword` column.
     let mut groups = false;
     let mut reads_keywords = false;
     plan.apply_with_subqueries(|node| {
         match node {
-            LogicalPlan::Aggregate(_) => groups = true,
+            LogicalPlan::Aggregate(_) | LogicalPlan::Distinct(_) => groups = true,
             LogicalPlan::TableScan(scan) => {
                 reads_keywords |= supertable_provider(&scan.source)
                     .is_some_and(|provider| has_keyword_column(provider.manifest()));
@@ -1594,15 +1595,20 @@ fn rewrite_grouped_count_from_value_counts(
     aggregate: &Aggregate,
     requests: &mut StatsRequests,
 ) -> DfResult<Option<LogicalPlan>> {
-    let [Expr::Column(group_column)] = aggregate.group_expr.as_slice() else {
+    let Some(group_column) = grouping_column(aggregate) else {
         return Ok(None);
     };
     let Some(kinds) = parse_aggregates(&aggregate.aggr_expr) else {
         return Ok(None);
     };
-    if !matches!(kinds.as_slice(), [AggKind::CountStar]) {
-        return Ok(None);
-    }
+    // `GROUP BY column` with no aggregate is the column's distinct values:
+    // `SELECT DISTINCT column`, and `COUNT(DISTINCT column)` once DataFusion
+    // has turned it into a grouping.
+    let counted = match kinds.as_slice() {
+        [AggKind::CountStar] => true,
+        [] => false,
+        _ => return Ok(None),
+    };
     // The value counts are exact counts of the column's non-null values.
     // Over the whole table the null group is counted from the null counts
     // as well; filtered to the non-null values, there is none.
@@ -1634,8 +1640,13 @@ fn rewrite_grouped_count_from_value_counts(
             }
             Ok(None)
         }
-        false => grouping_from_terms(aggregate, provider, nulls_filtered, term_counts),
+        false => grouping_from_terms(aggregate, provider, counted, nulls_filtered, term_counts),
     };
+    // The statistics count values but list none without their counts: a
+    // distinct grouping is answered from the term counts alone.
+    if !counted {
+        return from_terms(requests);
+    }
     let Some(counts_split) =
         split_value_counts(provider, column, !nulls_filtered, "grouped count", requests)
     else {
@@ -1698,13 +1709,26 @@ fn rewrite_grouped_count_from_value_counts(
     .map(Some)
 }
 
-/// `aggregate`, a grouping of a `keyword` column with `COUNT(*)`, answered
-/// from `term_counts`, the column's live value counts read before the
-/// statement was optimized:
+/// The single grouping column of `aggregate`, under an alias or not (as
+/// DataFusion names the column of a distinct count it turns into a
+/// grouping).
+fn grouping_column(aggregate: &Aggregate) -> Option<&Column> {
+    match aggregate.group_expr.as_slice() {
+        [expr] => match unaliased(expr) {
+            Expr::Column(column) => Some(column),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `aggregate`, a grouping of a `keyword` column with `COUNT(*)`
+/// (`counted`) or with no aggregate, answered from `term_counts`, the
+/// column's live value counts read before the statement was optimized:
 ///
 /// ```text
 /// Projection(the aggregate's names)
-///   └─ TableScan(a memory table of (value, count))
+///   └─ TableScan(a memory table of (value, count), or of value alone)
 /// ```
 ///
 /// `None`, leaving the grouping to the scan, when there are no counts (the
@@ -1714,6 +1738,7 @@ fn rewrite_grouped_count_from_value_counts(
 fn grouping_from_terms(
     aggregate: &Aggregate,
     provider: &SupertableProvider,
+    counted: bool,
     nulls_filtered: bool,
     term_counts: Option<LiveTermCounts>,
 ) -> DfResult<Option<LogicalPlan>> {
@@ -1741,7 +1766,10 @@ fn grouping_from_terms(
     };
     // The budget held the counts; the rows built from them leave it.
     drop(live);
-    let columns = vec![col(GROUP_VALUE), col(GROUP_COUNT)];
+    let (batch, columns) = match counted {
+        true => (batch, vec![col(GROUP_VALUE), col(GROUP_COUNT)]),
+        false => (batch.project(&[0])?, vec![col(GROUP_VALUE)]),
+    };
     debug!(
         groups = batch.num_rows(),
         "grouping answered from the term index"
@@ -1790,7 +1818,7 @@ fn union_with_scanned_groups(
     aggregate: &Aggregate,
     scan: &TableScan,
     restricted: SupertableProvider,
-    group_column: &datafusion::common::Column,
+    group_column: &Column,
     nulls_filtered: bool,
     rows: Vec<Vec<Expr>>,
 ) -> DfResult<LogicalPlan> {

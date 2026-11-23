@@ -1262,7 +1262,7 @@ mod tests {
     /// Groupings of a keyword column that SQL answers from its term counts
     /// once the statistics decline, each beside the same query forced to the
     /// scan by a `random() >= 0` every row passes.
-    const KEYWORD_GROUPINGS: [(&str, &str); 3] = [
+    const KEYWORD_GROUPINGS: [(&str, &str); 5] = [
         (
             "SELECT tag, COUNT(*) FROM supertable GROUP BY tag",
             "SELECT tag, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY tag",
@@ -1277,10 +1277,18 @@ mod tests {
             "SELECT tag, COUNT(*) AS c FROM supertable WHERE random() >= 0 GROUP BY tag \
              ORDER BY c DESC, tag LIMIT 7",
         ),
+        (
+            "SELECT COUNT(DISTINCT tag) FROM supertable",
+            "SELECT COUNT(DISTINCT tag) FROM supertable WHERE random() >= 0",
+        ),
+        (
+            "SELECT DISTINCT tag FROM supertable",
+            "SELECT DISTINCT tag FROM supertable WHERE random() >= 0",
+        ),
     ];
 
-    /// On a keyword column past the statistics' limit, grouped counts
-    /// answer as the scan does, with
+    /// On a keyword column past the statistics' limit, a grouped count, a
+    /// distinct count and a distinct listing answer as the scan does, with
     /// nulls, the empty string, case variants and deletes, and read no row:
     /// from the term index, and from each file's dictionary on a table that
     /// keeps no index. The same text in a `standard` column is scanned.
