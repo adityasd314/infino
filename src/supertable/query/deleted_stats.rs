@@ -690,7 +690,10 @@ mod tests {
         superfile::builder::FtsConfig,
         supertable::{
             Supertable, SupertableOptions, SupertableReader,
-            query::{sql::value_count_schema, value_count_carry::MAX_TABLE_VALUE_COUNTS},
+            query::{
+                covered_agg::TERM_COUNTS_TABLE, sql::value_count_schema,
+                value_count_carry::MAX_TABLE_VALUE_COUNTS,
+            },
         },
         test_helpers::{default_disk_cache, xorshift},
     };
@@ -1253,6 +1256,86 @@ mod tests {
                 stats.rows_materialized, 0,
                 "{label}: from the terms: {stats:?}"
             );
+        }
+    }
+
+    /// Groupings of a keyword column that SQL answers from its term counts
+    /// once the statistics decline, each beside the same query forced to the
+    /// scan by a `random() >= 0` every row passes.
+    const KEYWORD_GROUPINGS: [(&str, &str); 3] = [
+        (
+            "SELECT tag, COUNT(*) FROM supertable GROUP BY tag",
+            "SELECT tag, COUNT(*) FROM supertable WHERE random() >= 0 GROUP BY tag",
+        ),
+        (
+            "SELECT tag, COUNT(*) FROM supertable WHERE tag IS NOT NULL GROUP BY tag",
+            "SELECT tag, COUNT(*) FROM supertable WHERE tag IS NOT NULL AND random() >= 0 \
+             GROUP BY tag",
+        ),
+        (
+            "SELECT tag, COUNT(*) AS c FROM supertable GROUP BY tag ORDER BY c DESC, tag LIMIT 7",
+            "SELECT tag, COUNT(*) AS c FROM supertable WHERE random() >= 0 GROUP BY tag \
+             ORDER BY c DESC, tag LIMIT 7",
+        ),
+    ];
+
+    /// On a keyword column past the statistics' limit, grouped counts
+    /// answer as the scan does, with
+    /// nulls, the empty string, case variants and deletes, and read no row:
+    /// from the term index, and from each file's dictionary on a table that
+    /// keeps no index. The same text in a `standard` column is scanned.
+    #[test]
+    fn keyword_groupings_in_sql_answer_from_the_terms() {
+        assert!(MAX_TABLE_VALUE_COUNTS < KEYWORD_POOL as usize);
+        for term_index in [true, false] {
+            let (_dir, _cache_dir, table, _schema) = keyword_value_table(term_index);
+            let reader = table.reader().expect("reader");
+            for (sql, forced) in KEYWORD_GROUPINGS {
+                let label = format!("{sql}, term index {term_index}");
+                let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+                assert_eq!(answered, rows(&reader, forced), "{label}");
+                assert_eq!(stats.rows_materialized, 0, "{label}: {stats:?}");
+                assert!(
+                    explain(&reader, sql).contains(TERM_COUNTS_TABLE),
+                    "{label}: {}",
+                    explain(&reader, sql)
+                );
+                let plain = sql.replace("tag", "plain");
+                let (scanned, stats) = with_op_stats(|| rows(&reader, &plain));
+                assert_eq!(scanned, rows(&reader, &forced.replace("tag", "plain")));
+                assert!(stats.rows_materialized > 0, "{plain}: {stats:?}");
+            }
+        }
+    }
+
+    /// When a keyword column's term counts do not fit the connection memory
+    /// budget, SQL groupings of it run as planned, holding nothing for the
+    /// refused counts; with room again, they answer from the terms.
+    #[test]
+    fn keyword_groupings_over_the_budget_run_as_planned() {
+        let (_dir, _cache_dir, table, _schema) = keyword_value_table(true);
+        let reader = table.reader().expect("reader");
+        let budget = &reader.manifest().options.connection_memory_budget;
+        for (sql, forced) in KEYWORD_GROUPINGS {
+            let expected = rows(&reader, forced);
+            let held = budget.hold_all();
+            let used = budget.used();
+            let err = reader
+                .query_sql(sql)
+                .expect_err("the grouping meets the full budget");
+            assert!(
+                err.to_string().contains("during SQL query"),
+                "{sql}: refused by the grouping, not the terms: {err}"
+            );
+            assert_eq!(
+                budget.used(),
+                used,
+                "{sql}: the refused counts hold nothing"
+            );
+            drop(held);
+            let (answered, stats) = with_op_stats(|| rows(&reader, sql));
+            assert_eq!(answered, expected, "{sql}: with room");
+            assert_eq!(stats.rows_materialized, 0, "{sql}: {stats:?}");
         }
     }
 
